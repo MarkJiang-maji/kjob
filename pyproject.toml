@@ -1,0 +1,16 @@
+[project]
+name = "kjob"
+version = "0.1.0"
+description = "Slurm-like submission of scripts as Kubeflow PyTorchJobs that mirror the current notebook"
+requires-python = ">=3.9"
+dependencies = ["kubernetes>=28"]
+
+[project.scripts]
+kjob = "kjob.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["kjob"]
