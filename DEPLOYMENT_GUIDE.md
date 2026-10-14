@@ -6,7 +6,7 @@
 
 ## 目前在哪個階段
 
-2026-10-14 檢查的程式位於 `/home/mark/work/kjob`，試用分支為 `MarkJiang-maji/kjob:cgu-a30-fixes`，套件版本為 `0.3.0`。試用請指定此分支；老師審核合併前，直接從老師的 repo 或 fork 的 `main` 安裝仍會拿到原始版本。
+2026-10-14 檢查的程式位於 `/home/mark/work/kjob`，試用分支 `MarkJiang-maji/kjob:cgu-a30-fixes` 已發布，套件版本為 `0.3.0`。**不需要建立或合併 PR，就能從這個分支安裝、使用和測試。** PR #1 已依使用者指示關閉，尚未合併；之後要交給老師審核時再處理。試用請指定此分支；直接從老師的 repo 或 fork 的 `main` 安裝仍會拿到原始版本。
 
 建議先在少數 namespace 試用 CPU 與整張 A30。MPS 共享 GPU 暫不列入推薦流程：`gpunode051` 的 MPS server UID 與 root 工作不相容，CUDA 初始化曾卡住；這次沒有重啟或修改共用 MPS 服務。
 
@@ -98,7 +98,7 @@ kcancel "$JOB_ID"
 
 ## 二、使用者直接從 GitHub 安裝
 
-### 管理員：發布試用分支並建立 PR
+### 管理員：更新試用分支
 
 試用分支可透過已授權的 GitHub 連接器發布。若之後改用 Terminal 推送，先在該工作機完成 **MarkJiang-maji GitHub 登入**，並從 GitHub clone 發布分支，再修改及推送：
 
@@ -112,7 +112,7 @@ git push origin cgu-a30-fixes
 
 這段 clone 指令適用於還沒有 `kjob-trial` 目錄的工作機。不要把 token 寫在網址或指令裡。本機原始開發 commits 與 GitHub 發布 commit 的歷史可能不同；後續修改建議從發布分支 clone，避免直接推送造成 non-fast-forward。
 
-push 完成後，到以下頁面建立 PR，base 為 `wycc/kjob:main`，head 為 `MarkJiang-maji/kjob:cgu-a30-fixes`：
+更新分支後即可供使用者試用。PR 是另外的審核流程；目前先不建立或重新開啟。之後決定交給老師審核時，base 為 `wycc/kjob:main`，head 為 `MarkJiang-maji/kjob:cgu-a30-fixes`：
 
 [建立給老師審核的 PR](https://github.com/wycc/kjob/compare/main...MarkJiang-maji:kjob:cgu-a30-fixes?expand=1)
 

@@ -2,7 +2,7 @@
 
 檢查對象是 `/home/mark/work/kjob` 的 `cgu-a30-fixes` 分支，包含 Claude 的 `988bfbf`、`269fc42`、`e43affd` 三個本機 commit，以及本次修正與文件。
 
-**目前適合先試用 CPU 與整張 A30；不能說 MPS 共享 GPU 已全部驗證正常。** 修改以 `MarkJiang-maji/kjob:cgu-a30-fixes` 提供試用並交給老師審核，尚未全平台部署。試用與正式上線指令見 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
+**目前適合先試用 CPU 與整張 A30；不能說 MPS 共享 GPU 已全部驗證正常。** 修改已以 `MarkJiang-maji/kjob:cgu-a30-fixes` 提供試用，尚未全平台部署。PR #1 已依使用者指示關閉、尚未合併；安裝與測試不需要 PR。試用與正式上線指令見 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
 
 ## 本次發現與處理
 
