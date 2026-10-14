@@ -110,7 +110,7 @@ spec:
           env:
             - {name: HOME, value: /tmp}
             - {name: PYTHONPATH, value: /tmp/kjob-lib}
-            - {name: KJOB_SOURCE, value: "https://github.com/MarkJiang-maji/kjob/archive/PINNED_SHA.tar.gz"}
+            - {name: KJOB_SOURCE, value: "https://github.com/MarkJiang-maji/kjob/archive/0e6f72e266e06b6758028419379bcc008972f492.tar.gz"}
           command: [sh, -c]
           args:
             - pip install --quiet --no-cache-dir --target /tmp/kjob-lib "$KJOB_SOURCE" &&
