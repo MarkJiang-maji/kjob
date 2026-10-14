@@ -181,7 +181,7 @@ class SkillsTest(unittest.TestCase):
 class PublishTest(unittest.TestCase):
     def test_creates_configmap_when_missing_and_can_hide_names(self):
         api = fake_api()
-        api.replace_namespaced_config_map.side_effect = core.ApiException(status=404)
+        api.patch_namespaced_config_map.side_effect = core.ApiException(status=404)
         snap = cluster.build_snapshot(api, hide_names=True)
         cluster.publish(snap, api)
         body = api.create_namespaced_config_map.call_args[0][1]

@@ -150,8 +150,8 @@ def publish(snapshot: dict, core_api: client.CoreV1Api | None = None) -> None:
     body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=STATUS_CONFIGMAP, namespace=STATUS_NAMESPACE,
                                                            labels={"app.kubernetes.io/managed-by": "kjob"}),
                               data={STATUS_KEY: json.dumps(snapshot, separators=(",", ":"))})
-    try:
-        core_api.replace_namespaced_config_map(STATUS_CONFIGMAP, STATUS_NAMESPACE, body)
+    try:   # patch only the data: keeps the labels and kubectl annotations of the pre-created ConfigMap
+        core_api.patch_namespaced_config_map(STATUS_CONFIGMAP, STATUS_NAMESPACE, {"data": body.data})
     except ApiException as e:
         if e.status != 404:
             raise
