@@ -66,12 +66,12 @@ kjob runs a script as a PyTorchJob that copies the Notebook: same image, same wo
 |---|---|---|
 | `-J, --job-name` | script name + suffix | job name (lowercase letters, digits, `-`) |
 | `-G, --gpus` | 1 | GPUs; `0` = CPU-only |
-| `-g, --gpu-type` | any | `v100`, `a5000`, `a30`, `a30-shared`, a name from `ksinfo` (e.g. `rtxpro6000`), or a raw product label; comma list allowed |
+| `-g, --gpu-type` | any | short name (`v100`, `a5000`, `a30`, `a30-shared`), a GPU_TYPE from `ksinfo` or an unambiguous part of it (case-insensitive), a node name, or a raw product label; comma list = any of them. Ambiguous or unknown names are rejected |
 | `-w, --nodelist` / `-x, --exclude` | - | run on / avoid specific nodes |
 | `-c, --cpus` | 1 | CPU cores |
 | `--mem` | 2Gi | memory (Kubernetes units: `32Gi`) |
 | `--shm` | 256Mi | `/dev/shm`; raise to `8Gi`+ for PyTorch DataLoader with many workers |
-| `-t, --time` | none | time limit: `30` (min), `2:00:00`, `1-12:00:00`, `12h`, `2d` |
+| `-t, --time` | none | time limit from start (queueing not counted): `30` (min), `2:00:00`, `1-12:00:00`, `12h`, `2d`. At the limit the script gets SIGTERM and 30 s to save |
 | `--python` | notebook's python3 | interpreter for `.py` (e.g. a venv on `/home/jovyan`) |
 | `--env KEY=VALUE` | - | extra environment variable, repeatable |
 | `-D, --chdir` | current dir | working directory |
@@ -104,12 +104,13 @@ kqueue -u m1461023        # one user's (namespace's) workloads
 
 ## Why did it fail?
 
-* `exit code 137, OOMKilled`: out of memory: raise `--mem`.
+* `exit code 137, OOMKilled`: out of memory: raise `--mem`. (137 without OOMKilled: killed after the 30 s stop grace period.)
 * `Bus error` / DataLoader shared-memory errors: raise `--shm` (e.g. `--shm 16Gi`).
 * `CUDA out of memory`: smaller batch, or a GPU type with more memory.
 * `No such file or directory`: script or data not on a shared volume, or a relative path; use absolute paths.
 * `ModuleNotFoundError`: package installed somewhere the job cannot see; see step 2.
-* Stopped at the time limit: the job ends with `DeadlineExceeded` in `kshow`; resubmit with a larger `-t` and
+* Stopped at the time limit: `DeadlineExceeded` (ksrun/kwait/kshow), `STOPPED` in kacct. Training code should handle
+  SIGTERM (save a checkpoint) since it gets 30 s before being killed; resubmit with a larger `-t` and
   resume from a checkpoint.
 
 ## Cancel and clean up

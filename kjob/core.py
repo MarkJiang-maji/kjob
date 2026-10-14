@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import sys
 import time
@@ -48,7 +49,11 @@ DEFAULT_CPUS, DEFAULT_MEMORY, DEFAULT_SHM = 1, "2Gi", "256Mi"
 
 
 def unique_name(stem: str) -> str:
-    return f"{sanitize_name(stem)[:37]}-{uuid.uuid4().hex[:12]}"
+    try:
+        base = sanitize_name(stem)[:37].rstrip("-")
+    except ValueError:      # e.g. a script name without ASCII letters or digits
+        base = "job"
+    return f"{base}-{uuid.uuid4().hex[:12]}"
 
 
 def _matches(selector: dict, labels: dict) -> bool:
@@ -87,10 +92,13 @@ def current_notebook() -> str:
 
 
 def sanitize_name(name: str) -> str:
-    """Kubernetes object names: lowercase alphanumerics and '-', at most 50 chars (pods add '-master-0')."""
+    """Job names: lowercase alphanumerics and '-', starting with a letter (the operator requires a DNS-1035 label),
+    at most 50 chars (pods add '-master-0')."""
     n = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
     if not n:
         raise ValueError(f"invalid job name {name!r}")
+    if not n[0].isalpha():
+        n = "j-" + n
     return n[:50].rstrip("-")
 
 
@@ -104,6 +112,28 @@ def _nfs_mounts() -> dict[str, tuple[str, str]]:
             server, path = src.rsplit(":", 1)
             out[mnt] = (server, path)
     return out
+
+
+def job_shell(name: str, command: str, workdir: str, log: str) -> str:
+    """Container command. Output goes to the pod log and to the log file. The script runs in its own process group
+    and gets the SIGTERM sent at the -t limit or by kcancel, so it can save state within the grace period
+    (bash as PID 1 would otherwise ignore SIGTERM and everything is killed 30 s later)."""
+    q, ts = shlex.quote, "$(date -u +%FT%TZ)"
+    return (
+        "set -o pipefail\n"
+        f"mkdir -p {q(str(Path(log).parent))}\n"
+        f"cd {q(workdir)} || exit 1\n"
+        'state="${TMPDIR:-/tmp}/kjob-$$"\n'
+        f"log={q(log)}\n"
+        f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel)\" | tee -a \"$log\"; "
+        'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
+        f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE"\n'
+        f"  if command -v setsid >/dev/null 2>&1; then setsid {command} & else {command} & fi\n"
+        '  echo $! > "$state.pid"; wait $!; rc=$?\n'
+        f'  echo "[kjob {ts}] exit code $rc"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" &\n'
+        "tee_pid=$!\n"
+        "while kill -0 $tee_pid 2>/dev/null; do wait $tee_pid; done\n"
+        'exit "$(cat "$state.rc" 2>/dev/null || echo 1)"\n')
 
 
 @dataclass
@@ -281,10 +311,7 @@ class KJob:
         s.validate()
         workdir = s.workdir or t.working_dir
         log = s.log_path()
-        shell = (f"set -o pipefail; mkdir -p {shlex.quote(str(Path(log).parent))}; cd {shlex.quote(workdir)} && "
-                 f"{{ echo \"[kjob $(date -u +%FT%TZ)] start {s.name} on node $KJOB_NODE\"; {s.command()}; rc=$?; "
-                 f"echo \"[kjob $(date -u +%FT%TZ)] exit code $rc\"; exit $rc; }} "
-                 f"2>&1 | tee -a {shlex.quote(log)}")
+        shell = job_shell(s.name, s.command(), workdir, log)
         res = {"cpu": str(s.cpus), "memory": s.memory}
         if s.gpus:
             res["nvidia.com/gpu"] = str(s.gpus)  # CPU-only jobs must not request GPUs at all
@@ -402,9 +429,12 @@ class KJob:
     def _warn_unshared_paths(self) -> None:
         shared = self.t.shared_paths()
         script = Path(self.spec.script).expanduser().resolve()
-        if not script.is_file():
+        paths = [self.spec.workdir or self.t.working_dir, self.spec.log_dir]
+        if script.is_file():
+            paths.append(str(script))
+        elif "/" in self.spec.script or not shutil.which(self.spec.script):
             raise ValueError(f"Script is not a regular file: {script}")
-        paths = [self.spec.workdir or self.t.working_dir, self.spec.log_dir, str(script)]
+        # else: a command on PATH (e.g. nvidia-smi); the job uses the same image, so it is there too
         for p in paths:
             resolved = str(Path(p).expanduser().resolve())
             covering = [m for m in self.t.volume_mounts if resolved == m.mount_path or
@@ -473,6 +503,8 @@ class KJob:
                     if ev not in seen:
                         seen.add(ev)
                         report(f"kjob: {self.spec.name} event: {ev}")
+                    if "FailedValidation" in ev.split(":", 1)[0]:
+                        return "Invalid"      # the operator rejected the job; it will never get a pod
             if st in TERMINAL:
                 return st
             if timeout is not None and time.time() - t0 > timeout:
@@ -495,6 +527,13 @@ class KJob:
         finally:
             resp.close()
 
+    def stop_reason(self) -> str | None:
+        """Why the pod ended, when the pod says so (DeadlineExceeded at the -t limit)."""
+        try:
+            return self._pod().status.reason
+        except ApiException:
+            return None
+
     def exit_code(self) -> int | None:
         try:
             pod = self._pod()
@@ -513,6 +552,9 @@ class KJob:
         report = report or (lambda m: print(m, file=sys.stderr, flush=True))
         last_code = None
         phase = self.wait_for_pod(report=report)
+        if phase == "Invalid":
+            report(f"kjob: {self.spec.name} was rejected by the training operator (see the event above)")
+            return 1
         if phase != "Deleted":
             try:
                 report(f"kjob: {self.spec.name} running on {self._pod().spec.node_name}")
@@ -532,7 +574,7 @@ class KJob:
             st = self.state()
         code = self.exit_code()
         code = code if code is not None else last_code
-        reason = getattr(self, "exit_reason", None)
+        reason = self.stop_reason() or getattr(self, "exit_reason", None)
         detail = f", {reason}" if reason and reason not in ("Completed", "Error") else ""
         report(f"kjob: {self.spec.name} {st} (exit code {code}{detail})")
         return code if code is not None else (0 if st == "Succeeded" else 1)
@@ -585,20 +627,31 @@ def read_history() -> list[dict]:
     return out
 
 
-def log_result(path: str) -> tuple[str | None, str | None, int | None]:
-    """(start, end, exit code) from the [kjob ...] lines the job wrapper writes into its log."""
-    start = end = code = None
+def log_runs(path: str) -> list[dict]:
+    """Runs recorded in a job log by the wrapper's [kjob ...] lines: start, end, exit code, stopped (SIGTERM)."""
+    runs = []
     try:
         with open(path, errors="replace") as f:
             for line in f:
-                m = re.match(r"\[kjob (\S+)\] (start|exit code (\d+))", line)
-                if m and m.group(2) == "start":
-                    start, end, code = m.group(1), None, None   # a rerun into the same log starts over
-                elif m:
-                    end, code = m.group(1), int(m.group(3))
+                m = re.match(r"\[kjob (\S+)\] (start|exit code (\d+)|stopping)", line)
+                if not m:
+                    continue
+                if m.group(2) == "start" or not runs:
+                    runs.append({"start": m.group(1) if m.group(2) == "start" else None, "end": None, "code": None,
+                                 "stopped": False})
+                if m.group(2) == "stopping":
+                    runs[-1]["stopped"], runs[-1]["end"] = True, m.group(1)
+                elif m.group(3):
+                    runs[-1]["end"], runs[-1]["code"] = m.group(1), int(m.group(3))
     except OSError:
         pass
-    return start, end, code
+    return runs
+
+
+def log_result(path: str) -> tuple[str | None, str | None, int | None]:
+    """(start, end, exit code) of the last run in a job log."""
+    runs = log_runs(path)
+    return (runs[-1]["start"], runs[-1]["end"], runs[-1]["code"]) if runs else (None, None, None)
 
 
 # ---------- namespace-level helpers (used by the CLI) ----------

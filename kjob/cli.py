@@ -45,7 +45,10 @@ def parse_time(value: str) -> int:
     v = value.strip().lower()
     m = re.fullmatch(r"(\d+)\s*([smhd])", v)
     if m:
-        return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        total = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        if total <= 0:
+            raise ValueError
+        return total
     days = 0
     if "-" in v:
         d, v = v.split("-", 1)
@@ -74,6 +77,12 @@ def _time_arg(value: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid time {value!r} (examples: 30, 2:00:00, 1-12:00:00, 90m, 12h)")
 
 
+def _nonneg(v: str) -> int:
+    if not v.isdigit():
+        raise argparse.ArgumentTypeError(f"expected a number >= 0, got {v!r}")
+    return int(v)
+
+
 def _slurm_mem(v: str) -> str:
     """Slurm sizes are binary: 32G -> 32Gi; a bare number is MiB."""
     m = re.fullmatch(r"(\d+)([KMGT]?)B?", v.upper())
@@ -90,6 +99,9 @@ def _translate_sbatch(tokens: list[str], warn) -> list[str]:
     out, i = [], 0
     while i < len(tokens):
         tok = tokens[i]
+        if re.fullmatch(r"-[A-Za-z]\S+", tok):            # attached short form: -c4, -Jname
+            tokens = tokens[:i] + [tok[:2], tok[2:]] + tokens[i + 1:]
+            tok = tokens[i]
         if tok.startswith("--") and "=" in tok:
             key, val = tok.split("=", 1)
         elif (tok in _SBATCH_SAME or tok in ("--mem", "--gres", "--gpus", "-G", "--gpus-per-node")) and i + 1 < len(tokens):
@@ -101,8 +113,12 @@ def _translate_sbatch(tokens: list[str], warn) -> list[str]:
         else:
             key, val = tok, None
         i += 1
+        if key in ("-t", "--time") and val and val.upper() in ("UNLIMITED", "INFINITE"):
+            continue                           # no limit is the kjob default
         if key in _SBATCH_SAME and val is not None:
             out += [_SBATCH_SAME[key], val]
+        elif key == "--mem" and val and re.fullmatch(r"0+[KMGT]?B?", val.upper()):
+            warn("kjob: ignoring #SBATCH --mem=0 (all node memory); set --mem explicitly")
         elif key == "--mem" and val:
             out += ["--mem", _slurm_mem(val)]
         elif key in ("--gpus", "-G", "--gpus-per-node") and val:
@@ -163,35 +179,71 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the script")
 
 
+def _norm(x: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", x.lower())
+
+
 def resolve_gpu_types(values: list[str], node: str | None, snapshot=None) -> tuple[list[str], str | None]:
-    """Map -g values to product labels. A name that only matches an unlabeled GPU node (e.g. rtxpro6000) becomes -w."""
+    """Map -g values to nvidia.com/gpu.product labels using the GPU types ksinfo shows.
+
+    Exact type or host names win; otherwise a part of a name must match exactly one type ("a5000", "V100-SXM2").
+    A host name, or a type that exists only on an unlabeled node (e.g. rtxpro6000), becomes a node pin (-w)."""
     out = []
+    snap = snapshot
     for v in values:
-        label_like = v.split("-")[0] in ("NVIDIA", "Tesla", "Quadro")
         if v in core.GPU_PRODUCTS:
             out.append(v)
             continue
-        try:
-            snap = snapshot if snapshot is not None else cluster.load_snapshot()
-        except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
-            if not label_like:
-                print(f"kjob: {v!r} is not a short GPU name ({', '.join(core.GPU_PRODUCTS)}); using it as the raw "
-                      "nvidia.com/gpu.product label", file=sys.stderr)
-            out.append(v)
+        label_like = v.split("-")[0] in ("NVIDIA", "Tesla", "Quadro")
+        if snap is None:
+            try:
+                snap = cluster.load_snapshot()
+            except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
+                if label_like:
+                    out.append(v)       # a raw product label; nothing to check it against
+                    continue
+                raise ValueError(f"Unknown GPU type {v!r}: use a short name ({', '.join(core.GPU_PRODUCTS)}), a full "
+                                 "nvidia.com/gpu.product value, or -w NODE (the cluster GPU list is not available "
+                                 "to check other names).") from None
+        nodes = snap.get("nodes", [])
+        types = {}
+        for n in nodes:
+            types.setdefault(cluster.node_type(n), []).append(n)
+        q = _norm(v)
+        host = [n for n in nodes if _norm(n["name"]) == q]
+        exact = [t for t in types if _norm(t) == q]
+        partial = [t for t in types if q and q in _norm(t)]
+        if host and not exact:
+            if len(values) > 1 or node not in (None, host[0]["name"]):
+                raise ValueError(f"{v!r} is a node name; use it alone or with -w {host[0]['name']}.")
+            node = host[0]["name"]
             continue
-        if label_like and any(n["product"] == v for n in snap.get("nodes", [])):
-            out.append(v)
-            continue
-        hits = [n for n in snap.get("nodes", []) if cluster.matches_type(v, n)]
-        products = sorted({n["product"] for n in hits if n["product"]})
-        unlabeled = sorted({n["name"] for n in hits if not n["product"]})
-        if products:
-            out += products
-        elif len(unlabeled) == 1 and len(values) == 1 and node in (None, unlabeled[0]):
-            node = unlabeled[0]
+        hits = exact or partial
+        if not hits:
+            raise ValueError(f"GPU type {v!r} matches nothing in this cluster; see ksinfo for the names.")
+        if len(hits) > 1:
+            raise ValueError(f"GPU type {v!r} matches several types ({', '.join(sorted(hits))}); be more specific "
+                             "or list the ones you want with commas.")
+        t = hits[0]
+        if types[t][0]["product"]:
+            out.append(types[t][0]["product"])
+        elif len(types[t]) == 1 and len(values) == 1 and node in (None, types[t][0]["name"]):
+            node = types[t][0]["name"]          # unlabeled GPU node: select it by host name
         else:
-            raise ValueError(f"GPU type {v!r} matches no single GPU type; see ksinfo for the names.")
+            raise ValueError(f"{t} has no GPU product label; select it alone with -w {types[t][0]['name']}.")
     return out, node
+
+
+def _check_node(node: str | None, gpus: int) -> None:
+    """Reject a -w host that is not a GPU node, when the cluster view can tell."""
+    if not node or not gpus:
+        return
+    try:
+        names = {n["name"] for n in cluster.load_snapshot().get("nodes", [])}
+    except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
+        return
+    if names and node not in names:
+        raise ValueError(f"{node} is not a GPU node in this cluster; GPU nodes: {', '.join(sorted(names))}.")
 
 
 def _spec(a) -> core.JobSpec:
@@ -200,10 +252,12 @@ def _spec(a) -> core.JobSpec:
         raise ValueError("--env must be KEY=VALUE.")
     env = dict(e.split("=", 1) for e in a.env)
     gpu_types, node = resolve_gpu_types([g for g in a.gpu_type.split(",") if g], a.nodelist)
+    if a.nodelist and a.gpus:
+        _check_node(node, a.gpus)
     spec = core.JobSpec(name=name, script=a.script, args=a.args, gpus=a.gpus, cpus=a.cpus, memory=a.mem, shm=a.shm,
                         gpu_types=gpu_types, node=node,
                         exclude_nodes=[n for n in a.exclude.split(",") if n], interpreter=a.python, env=env,
-                        workdir=str(Path(a.chdir or os.getcwd()).resolve()),
+                        workdir=str(Path(a.chdir or os.getcwd()).expanduser().resolve()),
                         log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl, time_limit=a.time)
     spec.validate()
     return spec
@@ -235,8 +289,11 @@ def _num(x: float) -> str:
 
 
 def _snapshot_banner(snap: dict) -> str:
-    src = "live" if snap.get("source") == "live" else f"published {_dur(cluster.snapshot_age(snap))} ago"
-    return f"cluster status ({src})"
+    if snap.get("source") == "live":
+        return "cluster status (live)"
+    age = cluster.snapshot_age(snap)
+    stale = "  WARNING: old data, the status service may be down" if age > 300 else ""
+    return f"cluster status (published {_dur(age)} ago){stale}"
 
 
 def _job_for(name: str) -> core.KJob:
@@ -265,6 +322,9 @@ def cmd_run(a) -> int:
 def cmd_wait(a) -> int:
     j = _job_for(a.name)
     report = lambda m: print(m, file=sys.stderr, flush=True)
+    if j.state() == "Deleted":
+        report(f"kjob: no job {a.name} in namespace {j.ns} (already deleted? see kacct / klogs {a.name})")
+        return 1
     try:
         return j.follow(report=report)
     except KeyboardInterrupt:
@@ -387,19 +447,28 @@ def cmd_show(a) -> int:
 def cmd_logs(a) -> int:
     j = _job_for(a.name)
     state = j.state()
+    report = lambda m: print(m, file=sys.stderr, flush=True)
     try:
         if state == "Deleted":
             raise ApiException(status=404)
         if a.follow:
+            if j.wait_for_pod(report=report) in ("Deleted", "Invalid"):   # still pending: wait instead of failing
+                raise ApiException(status=404)
             for line in j.stream_logs():
                 print(line, flush=True)
         else:
-            j._pod()
+            pod = j._pod()
+            if pod.status.phase == "Pending":
+                report(f"kjob: {a.name} has not started yet (Pending); kshow {a.name} shows why, klogs -f waits")
+                return 0
             print(j.core.read_namespaced_pod_log(j.pod_name, j.ns), end="")
         return 0
     except KeyboardInterrupt:
         return 130
     except ApiException as e:
+        if e.status == 400:
+            report(f"kjob: {a.name} has not started yet; try klogs -f {a.name}")
+            return 0
         if e.status != 404:
             raise
     try:
@@ -407,7 +476,8 @@ def cmd_logs(a) -> int:
         log = (obj["metadata"].get("annotations") or {}).get("kjob/log")
     except ApiException:
         log = None
-    log = log or str(Path(a.log_dir) / f"{a.name}.log")
+    rec = next((r for r in reversed(core.read_history()) if r["name"] == a.name), None)
+    log = log or (rec or {}).get("log") or str(Path(a.log_dir) / f"{a.name}.log")
     if os.path.exists(log):
         print(f"kjob: pod not available; showing {log}", file=sys.stderr)
         print(open(log).read(), end="")
@@ -418,41 +488,64 @@ def cmd_logs(a) -> int:
 
 def cmd_cancel(a) -> int:
     ns = core.current_namespace()
+    if not (a.names or a.finished or a.all_mine):
+        raise ValueError("give job names, --finished or --all-mine")
     targets = {n: None for n in a.names}
     if a.finished or a.all_mine:
         notebook = None if a.all_notebooks else core.current_notebook()
         for o in core.list_jobs(notebook=notebook):
             if a.all_mine or core.job_state(o) in core.TERMINAL:
                 targets[o["metadata"]["name"]] = o["metadata"].get("uid")
+    missing = 0
     for n, uid in targets.items():
         deleted = core.delete_job(ns, n, uid=uid)
         print(f"{'deleted' if deleted else 'not found or replaced'}: {n}")
-    return 0
+        missing += not deleted and n in a.names
+    return 1 if missing else 0
+
+
+def _ts(x: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(x.replace("Z", "+00:00"))
 
 
 def cmd_acct(a) -> int:
-    hist = core.read_history()[-a.n:] if a.n else core.read_history()
+    hist = core.read_history()
     try:
         live = {o["metadata"]["name"]: core.job_state(o) for o in core.list_jobs()}
     except (ApiException, HTTPError, ConfigException):
         live = {}              # history still works without cluster access
-    rows = []
+    runs, seen, rows = {}, {}, []
     for r in hist:
-        start, end, code = core.log_result(r.get("log", ""))
-        if code is not None:
+        log = r.get("log", "")
+        if log not in runs:
+            runs[log] = core.log_runs(log)
+        i = seen[log] = seen.get(log, -1) + 1      # the i-th submission writing to this log is its i-th run
+        run = runs[log][i] if i < len(runs[log]) else None
+        last = i == sum(1 for x in hist if x.get("log") == log) - 1
+        code = run and run["code"]
+        if run and run["stopped"]:
+            state = "STOPPED"      # time limit or kcancel
+        elif code is not None:
             state = "COMPLETED" if code == 0 else "FAILED"
-        elif r["name"] in live:
-            state = live[r["name"]].upper()
+        elif last and r["name"] in live:
+            state = {"Created": "PENDING"}.get(live[r["name"]], live[r["name"]].upper())
         else:
-            state = "ENDED?"       # cancelled, stopped by the time limit, or never started
+            state = "ENDED?"       # deleted before it finished, or never started
         elapsed = None
-        if start:
-            t1 = dt.datetime.fromisoformat((end or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")).replace("Z", "+00:00"))
-            elapsed = int((t1 - dt.datetime.fromisoformat(start.replace("Z", "+00:00"))).total_seconds())
+        if run and run["start"]:
+            end = run["end"]
+            if not end and not (last and r["name"] in live):      # no end line: use the log's last write
+                try:
+                    end = dt.datetime.fromtimestamp(os.path.getmtime(log), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except OSError:
+                    end = None
+            if end or (last and r["name"] in live):
+                t1 = _ts(end) if end else dt.datetime.now(dt.timezone.utc)
+                elapsed = max(int((t1 - _ts(run["start"])).total_seconds()), 0)
         where = ",".join(r.get("gpu_types") or []) or r.get("node") or ("cpu" if not r.get("gpus") else "any")
         rows.append([r["name"], r["submitted"].replace("T", " ")[:16], r.get("gpus", 0), where, state,
                      code if code is not None else "-", _dur(elapsed)])
-    _table(["NAME", "SUBMITTED(UTC)", "GPU", "GPU_TYPE/NODE", "STATE", "EXIT", "ELAPSED"], rows)
+    _table(["NAME", "SUBMITTED(UTC)", "GPU", "GPU_TYPE/NODE", "STATE", "EXIT", "ELAPSED"], rows[-a.n:] if a.n else rows)
     return 0
 
 
@@ -472,8 +565,12 @@ def _my_tolerations() -> list | None:
 
 def _tolerated(taint: str, tolerations: list) -> bool:
     key, _, value = taint.partition("=")
-    return any(t.get("key") == key and (t.get("operator") == "Exists" or t.get("value", "") == value)
-               for t in tolerations)
+    for t in tolerations:
+        if t.get("operator") == "Exists" and not t.get("key"):
+            return True                        # tolerates every taint
+        if t.get("key") == key and (t.get("operator") == "Exists" or t.get("value", "") == value):
+            return True
+    return False
 
 
 def cmd_sinfo(a) -> int:
@@ -607,7 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=lambda a: cmd_cancel(argparse.Namespace(names=[], finished=True, all_mine=False,
                                                               all_notebooks=a.all_notebooks)))
     p = sub.add_parser("acct", help="jobs you submitted, with exit code and run time (sacct)")
-    p.add_argument("-n", type=int, default=20, help="last N jobs (default 20, 0 = all)")
+    p.add_argument("-n", type=_nonneg, default=20, help="last N jobs (default 20, 0 = all)")
     p.set_defaults(fn=cmd_acct)
     p = sub.add_parser("sinfo", help="GPU types and nodes: total / used / free / waiting (sinfo)")
     p.add_argument("-g", "--gpu-type", default=None, help="only this GPU type or node, and list its workloads")
@@ -619,6 +716,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", default="~/.claude/skills", help="skills directory (default ~/.claude/skills)")
     p.set_defaults(fn=cmd_install_skills)
     p = sub.add_parser("publish-status", help="(administrators) publish the cluster status ConfigMap")
+    for sp in sub.choices.values():
+        sp.set_defaults(parser=sp)
     p.add_argument("--interval", type=int, default=30, help="seconds between updates")
     p.add_argument("--once", action="store_true", help="publish once and exit")
     p.add_argument("--hide-names", action="store_true", help="publish namespaces but not workload names")
@@ -630,25 +729,36 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     ap = build_parser()
     a = ap.parse_args(argv)
+    err = a.parser.error
     if a.cmd in ("submit", "run"):
+        cli_only = a
         extra = script_directives(a.script)
         if extra:
             a = ap.parse_args(argv[:1] + extra + argv[1:])   # later (command-line) options override directives
+            if cli_only.gpus == 0 and not cli_only.gpu_type:
+                a.gpu_type = ""                             # -G 0 on the command line drops a directive's GPU type
     if getattr(a, "args", None) and a.args[:1] == ["--"]:
         a.args = a.args[1:]
-    if a.cmd in ("install-skills", "acct"):
-        return a.fn(a)
     try:
-        core._load_config()
-    except ConfigException:
-        ap.exit(1, "kjob: no Kubernetes access; run kjob inside a Kubeflow Notebook (or set KUBECONFIG)\n")
-    try:
+        if a.cmd not in ("install-skills", "acct"):
+            try:
+                core._load_config()
+            except ConfigException:
+                ap.exit(1, "kjob: no Kubernetes access; run kjob inside a Kubeflow Notebook (or set KUBECONFIG)\n")
         return a.fn(a)
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:                 # e.g. klogs ... | head
+        sys.stdout = open(os.devnull, "w")
+        return 0
     except ValueError as e:
-        ap.error(str(e))
+        err(str(e))
     except cluster.ClusterViewUnavailable as e:
         ap.exit(1, f"kjob: {e}\n")
     except ApiException as e:
+        if e.status == 409 and a.cmd in ("submit", "run"):
+            ap.exit(1, f"kjob: a job named {getattr(a, 'job_name', '')} already exists; choose another -J or "
+                       f"kcancel it first\n")
         ap.exit(1, f"kjob: Kubernetes API error ({e.status}): {e.reason}\n")
     except HTTPError as e:  # connection refused/reset, timeouts: the job itself is unaffected
         ap.exit(1, f"kjob: lost connection to the Kubernetes API ({type(e).__name__}); submitted jobs keep running, "

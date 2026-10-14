@@ -75,6 +75,7 @@ ksrun -G 1 -g v100 -c 2 --mem 8Gi ~/kjob-demo/gpu_test.py
 ```text
 kjob: submitted gpu-test-1a2b3c4d5e6f (log: /home/jovyan/kjob-logs/gpu-test-1a2b3c4d5e6f.log)
 kjob: gpu-test-1a2b3c4d5e6f running on hs5800-1
+[kjob 2026-10-15T03:12:05Z] start gpu-test-1a2b3c4d5e6f on node hs5800-1
 node: hs5800-1 | GPU: Tesla V100-SXM2-16GB
 step 1/5 ok
 ...
@@ -96,13 +97,14 @@ ksub -J demo1 -G 1 -g v100 -c 2 --mem 8Gi -t 30 ~/kjob-demo/gpu_test.py
 Submitted job demo1  (log: /home/jovyan/kjob-logs/demo1.log)
 ```
 
-`-t 30` 是時間上限 30 分鐘，時間到工作會被停止（格式也可用 `2:00:00`、`1-12:00:00`、`12h`）。
+`-t 30` 是時間上限 30 分鐘，從開始執行算起，時間到工作會被停止（格式也可用 `2:00:00`、`1-12:00:00`、`12h`）。
+停止前程式會先收到 SIGTERM，有 30 秒可以存 checkpoint。
 
 ## 6. 查看工作
 
 ```bash
 kqueue              # 自己的工作：狀態、節點、GPU 數
-klogs demo1 -f      # 即時看輸出，Ctrl-C 只停止觀看，工作繼續跑
+klogs demo1 -f      # 即時看輸出（還在排隊會先等），Ctrl-C 只停止觀看，工作繼續跑
 kshow demo1         # 詳細資訊；排隊太久時看這裡的 event 找原因
 kwait demo1         # 等到結束，回傳程式的結束代碼
 kacct               # 歷史紀錄：是否成功、結束代碼、跑了多久
@@ -158,6 +160,7 @@ kclean             # 刪除這個 Notebook 已結束的工作物件
 |---|---|
 | 一直 `Pending` | `kshow 名稱` 看 event。`Insufficient nvidia.com/gpu`：該型號滿了，等候或換型號；`exceeded quota`：namespace GPU 配額用完（關掉閒置的 GPU Notebook）；`untolerated taint`：沒有該節點權限 |
 | `exit code 137, OOMKilled` | 記憶體不足，加大 `--mem` |
+| `DeadlineExceeded` | 超過 `-t` 時間上限，加大 `-t` 或從 checkpoint 續跑 |
 | `Bus error`、DataLoader 錯誤 | 加大 `--shm` |
 | `No such file or directory` | 檔案不在共用磁碟或用了相對路徑 |
 | `ModuleNotFoundError` | 套件裝在工作看不到的地方，見第 7 節 |

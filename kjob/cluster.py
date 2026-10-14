@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import time
 
 from kubernetes import client
@@ -111,6 +112,8 @@ def build_snapshot(core_api: client.CoreV1Api | None = None, hide_names: bool = 
             for c in p.status.conditions or []:
                 if c.type == "PodScheduled" and c.status == "False":
                     reason = (c.message or c.reason or "")[:200]
+                    if hide_names:      # scheduler messages can name other users' volumes
+                        reason = re.sub(r'"[^"]*"', '"-"', reason)
         start = p.status.start_time or p.metadata.creation_timestamp
         workloads.append({
             "namespace": p.metadata.namespace, "kind": kind, "name": "-" if hide_names else name,
@@ -186,7 +189,10 @@ def load_snapshot(core_api: client.CoreV1Api | None = None) -> dict:
             "The cluster-wide view is not available here: this account cannot list nodes, and the "
             f"{STATUS_NAMESPACE}/{STATUS_CONFIGMAP} ConfigMap is missing. Ask the administrator to deploy "
             "deploy/cluster-status.yaml.") from None
-    snap = json.loads((cm.data or {}).get(STATUS_KEY, "{}"))
+    snap = json.loads((cm.data or {}).get(STATUS_KEY) or "{}")
+    if not snap.get("generated"):
+        raise ClusterViewUnavailable(f"{STATUS_NAMESPACE}/{STATUS_CONFIGMAP} has no data yet; the status service "
+                                     "publishes it every 30 s.")
     snap["source"] = "published"
     return snap
 

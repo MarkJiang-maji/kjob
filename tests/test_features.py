@@ -69,8 +69,12 @@ class SnapshotTest(unittest.TestCase):
     def test_falls_back_to_published_configmap(self):
         api = fake_api()
         api.list_node.side_effect = core.ApiException(status=403)
-        api.read_namespaced_config_map.return_value = client.V1ConfigMap(data={"status.json": json.dumps({"nodes": [], "workloads": []})})
+        api.read_namespaced_config_map.return_value = client.V1ConfigMap(data={"status.json": json.dumps(
+            {"generated": "2026-01-01T00:00:00Z", "nodes": [], "workloads": []})})
         self.assertEqual(cluster.load_snapshot(api)["source"], "published")
+        api.read_namespaced_config_map.return_value = client.V1ConfigMap(data={"status.json": ""})
+        with self.assertRaisesRegex(cluster.ClusterViewUnavailable, "no data yet"):
+            cluster.load_snapshot(api)
         api.read_namespaced_config_map.side_effect = core.ApiException(status=404)
         with self.assertRaises(cluster.ClusterViewUnavailable):
             cluster.load_snapshot(api)
@@ -81,8 +85,24 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(cli.resolve_gpu_types(["rtx-a5000"], None, snap), (["NVIDIA-RTX-A5000"], None))
         self.assertEqual(cli.resolve_gpu_types(["rtxpro6000"], None, snap), ([], "rtxpro6000"))
         self.assertEqual(cli.resolve_gpu_types(["RTX PRO 6000"], None, snap), ([], "rtxpro6000"))
-        with self.assertRaises(ValueError):
-            cli.resolve_gpu_types(["h100"], None, snap)
+        self.assertEqual(cli.resolve_gpu_types(["a5000-1"], None, snap), ([], "a5000-1"))     # host name pins
+        for bad in ("h100", "rtx", "NVIDIA-H100"):      # unknown, ambiguous (A5000 and rtxpro6000), absent label
+            with self.assertRaises(ValueError, msg=bad):
+                cli.resolve_gpu_types([bad], None, snap)
+        with self.assertRaisesRegex(ValueError, "several types"):
+            cli.resolve_gpu_types(["rtx"], None, snap)
+        with mock.patch.object(cluster, "load_snapshot", side_effect=cluster.ClusterViewUnavailable("x")):
+            self.assertEqual(cli.resolve_gpu_types(["NVIDIA-A30"], None), (["NVIDIA-A30"], None))
+            with self.assertRaisesRegex(ValueError, "Unknown GPU type"):
+                cli.resolve_gpu_types(["rtxpro6000"], None)
+
+    def test_pinned_node_must_be_a_gpu_node(self):
+        snap = cluster.build_snapshot(fake_api())
+        with mock.patch.object(cluster, "load_snapshot", return_value=snap):
+            cli._check_node("a5000-1", 1)
+            with self.assertRaisesRegex(ValueError, "not a GPU node"):
+                cli._check_node("typo-node", 1)
+            cli._check_node("cpu-1", 0)                 # CPU jobs may go anywhere
 
     def test_sinfo_and_queue_output(self):
         snap = {**cluster.build_snapshot(fake_api()), "source": "live"}
@@ -100,6 +120,9 @@ class SnapshotTest(unittest.TestCase):
 
 class TimeAndDirectiveTest(unittest.TestCase):
     def test_time_formats(self):
+        for bad in ("0", "0m", "abc", "1:2:3:4"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
+                cli._time_arg(bad)
         for v, s in [("30", 1800), ("10:30", 630), ("2:00:00", 7200), ("1-12", 129600), ("1-00:30", 88200),
                      ("1-0:0:5", 86405), ("90m", 5400), ("12h", 43200), ("2d", 172800)]:
             self.assertEqual(cli.parse_time(v), s, v)
@@ -165,3 +188,102 @@ class PublishTest(unittest.TestCase):
         data = json.loads(body.data["status.json"])
         self.assertEqual({w["name"] for w in data["workloads"]}, {"-"})
         self.assertEqual({w["namespace"] for w in data["workloads"]}, {"alice", "bob", "carol"})
+
+
+class NamesAndWrapperTest(unittest.TestCase):
+    def test_job_names_start_with_a_letter(self):
+        self.assertEqual(core.sanitize_name("1digit"), "j-1digit")
+        self.assertTrue(core.unique_name("2stage").startswith("j-2stage-"))
+        self.assertTrue(core.unique_name("測試").startswith("job-"))
+
+    def test_wrapper_forwards_sigterm_and_keeps_exit_code(self):
+        import signal, subprocess, sys, time
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "s.py"
+            script.write_text("import signal,sys,time\n"
+                              "signal.signal(signal.SIGTERM, lambda *a: (print('saving', flush=True), sys.exit(7)))\n"
+                              "print('ready', flush=True)\ntime.sleep(30)\n")
+            log = Path(d) / "logs" / "j.log"
+            sh = core.job_shell("j", f"{sys.executable} {script}", d, str(log))
+            p = subprocess.Popen(["bash", "-c", sh], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(100):
+                if log.exists() and "ready" in log.read_text():
+                    break
+                time.sleep(0.1)
+            p.send_signal(signal.SIGTERM)
+            self.assertEqual(p.wait(timeout=10), 7)
+            text = log.read_text()
+            self.assertIn("stopping: SIGTERM", text)
+            self.assertIn("saving", text)
+            runs = core.log_runs(str(log))
+            self.assertEqual((len(runs), runs[0]["stopped"], runs[0]["code"]), (1, True, 7))
+            p = subprocess.Popen(["bash", "-c", core.job_shell("j", "bash -c 'exit 3'", d, str(log))],
+                                 stdout=subprocess.DEVNULL)
+            self.assertEqual(p.wait(timeout=10), 3)
+            self.assertEqual([r["code"] for r in core.log_runs(str(log))], [7, 3])
+
+    def test_path_command_allowed_but_missing_file_rejected(self):
+        from test_regressions import handle
+        j = handle()
+        j.t.volume_mounts = [client.V1VolumeMount(name="w", mount_path="/")]
+        j.t.volumes = [client.V1Volume(name="w", nfs=client.V1NFSVolumeSource(server="s", path="/"))]
+        j.spec.workdir, j.spec.log_dir = "/tmp", "/tmp"
+        j.spec.script = "bash"                         # a command on PATH, like nvidia-smi
+        j._warn_unshared_paths()
+        j.spec.script = "/no/such/file.py"
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            j._warn_unshared_paths()
+
+
+class CliBehaviourTest(unittest.TestCase):
+    def test_cli_gpu0_drops_directive_gpu_type(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write("#!/bin/bash\n#SBATCH --gres=gpu:v100:1 -c4\n#SBATCH --time=UNLIMITED --mem=0\necho hi\n")
+        self.assertEqual(cli.script_directives(f.name, warn=lambda m: None),
+                         ["-g", "v100", "-G", "1", "-c", "4"])           # UNLIMITED and --mem=0 dropped
+        seen = {}
+        with mock.patch.object(core, "_load_config"), \
+                mock.patch.object(cli, "cmd_submit", side_effect=lambda a: seen.update(vars(a)) or 0):
+            cli.main(["submit", "-G", "0", f.name])
+        self.assertEqual((seen["gpus"], seen["gpu_type"], seen["cpus"]), (0, "", 4))
+        Path(f.name).unlink()
+
+    def test_kcancel_requires_targets_and_reports_missing(self):
+        with mock.patch.object(core, "current_namespace", return_value="ns"):
+            with self.assertRaises(ValueError):
+                cli.cmd_cancel(argparse.Namespace(names=[], finished=False, all_mine=False, all_notebooks=False))
+            with mock.patch.object(core, "delete_job", return_value=False), mock.patch("sys.stdout", io.StringIO()):
+                self.assertEqual(cli.cmd_cancel(argparse.Namespace(names=["x"], finished=False, all_mine=False,
+                                                                   all_notebooks=False)), 1)
+
+    def test_hide_names_redacts_reasons(self):
+        api = fake_api()
+        pend = api.list_pod_for_all_namespaces.return_value.items[2]
+        pend.status.conditions[0].message = 'persistentvolumeclaim "secret-data" not found'
+        snap = cluster.build_snapshot(api, hide_names=True)
+        reason = next(w["reason"] for w in snap["workloads"] if w["state"] == "Pending")
+        self.assertNotIn("secret-data", reason)
+
+
+class AcctTest(unittest.TestCase):
+    def test_reused_name_stopped_and_pending(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "a.log"
+            log.write_text("[kjob 2026-01-01T00:00:00Z] start a on node n\n[kjob 2026-01-01T00:00:10Z] exit code 0\n"
+                           "[kjob 2026-01-01T01:00:00Z] start a on node n\n[kjob 2026-01-01T01:00:30Z] stopping: SIGTERM\n"
+                           "[kjob 2026-01-01T01:00:31Z] exit code 143\n")
+            hist = [{"name": "a", "submitted": "2026-01-01T00:00:00Z", "log": str(log), "gpus": 1},
+                    {"name": "a", "submitted": "2026-01-01T00:59:00Z", "log": str(log), "gpus": 1},
+                    {"name": "p", "submitted": "2026-01-01T02:00:00Z", "log": str(Path(d) / "p.log"), "gpus": 1}]
+            out = io.StringIO()
+            with mock.patch.object(core, "read_history", return_value=hist), \
+                    mock.patch.object(core, "list_jobs", return_value=[{"metadata": {"name": "p"},
+                                                                         "status": {"conditions": [{"type": "Created", "status": "True"}]}}]), \
+                    mock.patch("sys.stdout", out):
+                cli.cmd_acct(argparse.Namespace(n=0))
+        lines = out.getvalue().splitlines()[1:]
+        self.assertIn("COMPLETED", lines[0])
+        self.assertIn("0m10s", lines[0])
+        self.assertIn("STOPPED", lines[1])
+        self.assertIn("143", lines[1])
+        self.assertIn("PENDING", lines[2])

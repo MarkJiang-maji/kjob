@@ -25,7 +25,7 @@ done
 ## 2. 叢集狀態服務（選用，讓使用者看到整個叢集）
 
 `ksinfo` 與 `kqueue -A` 需要列出所有節點與所有 namespace 的 Pod，一般 Notebook 沒有這個權限。這個服務用一個小
-Deployment 每 30 秒把摘要寫進 ConfigMap `kjob-system/kjob-cluster-status`，並只開放所有帳號讀取這一個 ConfigMap。
+Deployment 每 30 秒把摘要寫進 ConfigMap `kjob-system/kjob-cluster-status`，並只開放所有 service account（Notebook）讀取這一個 ConfigMap。
 沒有安裝時，提交工作不受影響，只是這兩個指令會提示無法使用。
 
 ```bash
@@ -35,12 +35,14 @@ kubectl delete -f deploy/cluster-status.yaml           # 完整移除
 ```
 
 * 新增的物件：namespace `kjob-system`、ServiceAccount、只讀 nodes/pods 的 ClusterRole、只能寫該 ConfigMap 的 Role、
-  讓 `system:serviceaccounts` 與 `system:authenticated` 讀該 ConfigMap 的 Role，以及一個 Deployment
-  （`python:3.12-slim`，requests 20m CPU / 96Mi，以 UID 65534 執行）。不修改任何既有物件。
+  讓 `system:serviceaccounts` 讀該 ConfigMap 的 Role、該 ConfigMap 本身，以及一個 Deployment（`python:3.12-slim`，
+  requests 20m CPU / 96Mi，UID 65534、不可提權、drop ALL capabilities、RuntimeDefault seccomp）。不修改任何既有物件。
 * 摘要內容：每個 GPU 節點的型號、GPU/CPU/記憶體總量與已申請量、taint；每個 GPU 工作的 namespace、名稱、GPU 數、
   節點、狀態、等待原因。不含環境變數、指令、磁碟等內容。
-* 隱私：在 Deployment 的指令加上 `--hide-names`，只公開 namespace 不公開工作／Notebook 名稱。
-* Pod 啟動時從 GitHub 安裝 kjob；要固定版本，把 `KJOB_SOURCE` 改成 commit 的 archive 網址，或改用預裝 kjob 的 image。
+* 隱私：namespace 通常是學號／員工編號，所有 Notebook 都看得到。在 Deployment 的指令加上 `--hide-names`，
+  就不公開工作／Notebook 名稱，排隊原因中引號內的名稱（例如其他人的 PVC 名稱）也會遮掉。
+* 安全：收集者可以讀全叢集的 Pod spec（含環境變數），所以 `KJOB_SOURCE` 固定在一個審過的 commit
+  （`archive/<sha>.tar.gz`），升級時刻意改 SHA；也可以改用預裝 kjob 的 image。
 * 管理員在主機上直接執行 `ksinfo`、`kqueue -A`（有 cluster 讀取權限的 kubeconfig）會讀即時資料，不經過這個服務。
 
 ## 3. GPU 型號與受限節點
