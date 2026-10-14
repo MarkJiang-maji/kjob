@@ -1,0 +1,84 @@
+# kjob 管理員說明
+
+給叢集管理員：讓使用者能在 Notebook 裡使用 kjob 需要什麼，以及選用的叢集狀態服務。kjob 是使用者自行安裝的
+Python 套件，**不需要**修改 Notebook image、training operator 或節點。
+
+## 1. 叢集需求
+
+| 項目 | 需求 |
+|---|---|
+| Kubeflow Training Operator | 已安裝 PyTorchJob CRD（`kubectl get crd pytorchjobs.kubeflow.org`）。已在 `kubeflow/training-operator:v1-855e096` 驗證 |
+| Notebook 的 service account | 在自己 namespace 內：讀自己的 Pod、PodDefault、ResourceQuota、Event、Pod log；建立／讀取／刪除 PyTorchJob。Kubeflow profile 預設的 `default-editor` 已具備 |
+| 工作磁碟 | 使用者的 workspace 與資料要在 NFS 或 RWX 儲存上（工作可能跑在別的節點）。底層是 NFS 的 RWO PVC 由 kjob 自動改成 NFS 掛載；一般 RWO 區塊儲存不適用 |
+| GPU 標籤 | GPU 節點最好有 NVIDIA GPU Feature Discovery 的 `nvidia.com/gpu.product` 標籤，使用者才能用 `-g` 選型號 |
+| 網路 | 使用者安裝時需要能連 GitHub 與 PyPI；離線環境請改發 wheel（見第 4 節） |
+
+檢查某個 namespace 的權限：
+
+```bash
+SA=system:serviceaccount:<namespace>:default-editor
+for r in "create pytorchjobs.kubeflow.org" "list poddefaults.kubeflow.org" "list resourcequotas" "get pods/log" "list events"; do
+  echo "$r: $(kubectl auth can-i $r -n <namespace> --as=$SA)"
+done
+```
+
+## 2. 叢集狀態服務（選用，讓使用者看到整個叢集）
+
+`ksinfo` 與 `kqueue -A` 需要列出所有節點與所有 namespace 的 Pod，一般 Notebook 沒有這個權限。這個服務用一個小
+Deployment 每 30 秒把摘要寫進 ConfigMap `kjob-system/kjob-cluster-status`，並只開放所有帳號讀取這一個 ConfigMap。
+沒有安裝時，提交工作不受影響，只是這兩個指令會提示無法使用。
+
+```bash
+kubectl apply -f deploy/cluster-status.yaml
+kubectl -n kjob-system logs deploy/kjob-status        # 看到 "published N GPU nodes, M workloads" 即可
+kubectl delete -f deploy/cluster-status.yaml           # 完整移除
+```
+
+* 新增的物件：namespace `kjob-system`、ServiceAccount、只讀 nodes/pods 的 ClusterRole、只能寫該 ConfigMap 的 Role、
+  讓 `system:serviceaccounts` 與 `system:authenticated` 讀該 ConfigMap 的 Role，以及一個 Deployment
+  （`python:3.12-slim`，requests 20m CPU / 96Mi，以 UID 65534 執行）。不修改任何既有物件。
+* 摘要內容：每個 GPU 節點的型號、GPU/CPU/記憶體總量與已申請量、taint；每個 GPU 工作的 namespace、名稱、GPU 數、
+  節點、狀態、等待原因。不含環境變數、指令、磁碟等內容。
+* 隱私：在 Deployment 的指令加上 `--hide-names`，只公開 namespace 不公開工作／Notebook 名稱。
+* Pod 啟動時從 GitHub 安裝 kjob；要固定版本，把 `KJOB_SOURCE` 改成 commit 的 archive 網址，或改用預裝 kjob 的 image。
+* 管理員在主機上直接執行 `ksinfo`、`kqueue -A`（有 cluster 讀取權限的 kubeconfig）會讀即時資料，不經過這個服務。
+
+## 3. GPU 型號與受限節點
+
+* `-g` 依 `nvidia.com/gpu.product` 標籤選節點。沒有此標籤的 GPU 節點，在 `ksinfo` 以節點名稱顯示，使用者可用
+  `-g 節點名稱` 或 `-w 節點名稱`。建議在該節點部署 GPU Feature Discovery，讓型號正確顯示。
+* 受限節點用 taint 保護（例如 `restricted-gpu=advance:NoSchedule`），再以 namespace 的 PodDefault 加上 toleration 開通。
+  kjob 會把 Notebook 符合的 PodDefault selector 標籤帶到工作上，selector 為空的 PodDefault 也會套用到工作，
+  所以已開通的 namespace 不需另外設定。kjob 不會自行加 toleration。
+* 簡稱表在 `kjob/core.py` 的 `GPU_PRODUCTS`；新增型號時可加一行，或讓使用者直接用 `ksinfo` 顯示的名稱。
+* MPS 共享 GPU：產品標籤以 `-SHARED` 結尾且 `nvidia.com/gpu.sharing-strategy=mps` 的節點。整張 GPU 的工作會自動
+  避開這類節點；共享工作不帶 `/dev/shm` volume（device plugin 會掛）。MPS server 的 UID 必須與工作相容，
+  目前 kjob 只允許 UID 0 的 Notebook 提交共享工作。
+
+## 4. 發布方式
+
+| 方式 | 做法 |
+|---|---|
+| GitHub（預設） | 使用者執行 README 的安裝指令，裝在自己的 `~/.local` |
+| wheel | `python3 -m pip wheel --no-deps -w dist .`，把 `dist/kjob-0.4.0-py3-none-any.whl` 給使用者，`pip install --user` 安裝 |
+| 預裝在 Notebook image | `deploy/Dockerfile`：`docker build --build-arg BASE_IMAGE=<image> --build-arg NOTEBOOK_USER=<原本的 USER> -f deploy/Dockerfile dist/` |
+
+## 5. 會建立的 Kubernetes 物件
+
+每個工作是一個 PyTorchJob（一個 Master replica、`restartPolicy: Never`），標籤
+`app.kubernetes.io/managed-by=kjob`、`kjob/notebook=<Notebook Pod>`，annotation 記錄指令、工作目錄、日誌路徑。
+`runPolicy`：`cleanPodPolicy: None`、`ttlSecondsAfterFinished`（預設 3600）、使用 `-t` 時加上
+`activeDeadlineSeconds`。不設定 `backoffLimit`：舊版 operator 搭配 `backoffLimit: 0` 會在記錄失敗前刪除並重建 Pod，
+導致腳本跑兩次。工作 Pod 不掛 service account token、不注入 Istio sidecar。
+
+列出／清除所有 kjob 工作：
+
+```bash
+kubectl get pytorchjobs -A -l app.kubernetes.io/managed-by=kjob
+kubectl delete pytorchjobs -n <namespace> -l app.kubernetes.io/managed-by=kjob
+```
+
+## 6. 尚未處理的平台事項
+
+kjob 的提交前檢查只是給使用者的提示，不能取代伺服器端的控制。以下需要在平台層處理：依 GPU 型號分配額、
+公平排隊（例如 Kueue）、限制工作可掛載的 NFS 路徑的 admission policy。

@@ -137,12 +137,16 @@ class SubmissionTests(unittest.TestCase):
         terms = m['affinity']['nodeAffinity']['requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][0]['matchExpressions']
         self.assertIn({'key': core.SHARING_STRATEGY_LABEL, 'operator': 'In', 'values': ['mps']}, terms)
 
-    def test_pinned_node_permission_failure_requires_explicit_type(self):
+    def test_pinned_node_permission_failure_falls_back_to_published_status(self):
         j = handle(node='mps-node')
         j.core.read_node.side_effect = core.ApiException(status=403)
-        with self.assertRaisesRegex(ValueError, 'specify -g'):
-            j.submit()
-        j.custom.create_namespaced_custom_object.assert_not_called()
+        snap = {'nodes': [{'name': 'mps-node', 'product': 'NVIDIA-A30-SHARED', 'sharing': 'mps'}]}
+        with mock.patch.object(core.cluster, 'load_snapshot', return_value=snap):
+            self.assertEqual(j._node_labels('mps-node')[core.SHARING_STRATEGY_LABEL], 'mps')
+        with mock.patch.object(core.cluster, 'load_snapshot', side_effect=core.cluster.ClusterViewUnavailable('x')), \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(j._node_labels('mps-node'), {})
+        self.assertIn('whole GPUs', err.getvalue())
 
     def test_authorized_pinned_mps_node_removes_shm(self):
         j = handle(node='mps-node')

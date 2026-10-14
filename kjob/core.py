@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import copy
+import json
 import os
 import re
 import shlex
@@ -24,6 +25,8 @@ from typing import Iterator
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 from kubernetes.utils.quantity import parse_quantity
+
+from . import cluster
 
 GROUP, VERSION, PLURAL = "kubeflow.org", "v1", "pytorchjobs"
 MANAGED_BY = "kjob"
@@ -205,6 +208,7 @@ class JobSpec:
     workdir: str | None = None
     log_dir: str = str(Path.home() / "kjob-logs")
     ttl_seconds: int = 3600                              # safety net if nobody monitors the job
+    time_limit: int | None = None                        # seconds; the job is stopped after this (like --time)
 
     def validate(self) -> None:
         if not isinstance(self.gpus, int) or self.gpus < 0:
@@ -213,6 +217,8 @@ class JobSpec:
             raise ValueError("CPU count must be a positive integer.")
         if not isinstance(self.ttl_seconds, int) or self.ttl_seconds < 0:
             raise ValueError("TTL must be a nonnegative integer.")
+        if self.time_limit is not None and (not isinstance(self.time_limit, int) or self.time_limit < 1):
+            raise ValueError("Time limit must be a positive number of seconds.")
         for key, value in (("memory", self.memory), ("shared memory", self.shm)):
             try:
                 amount = parse_quantity(value)
@@ -335,7 +341,8 @@ class KJob:
             "spec": {
                 # RestartPolicy Never already makes script failures terminal. A zero backoffLimit
                 # on older operators deletes a failed Pod before recording Failed and can recreate it.
-                "runPolicy": {"cleanPodPolicy": "None", "ttlSecondsAfterFinished": s.ttl_seconds},
+                "runPolicy": {"cleanPodPolicy": "None", "ttlSecondsAfterFinished": s.ttl_seconds,
+                              **({"activeDeadlineSeconds": s.time_limit} if s.time_limit else {})},
                 "pytorchReplicaSpecs": {"Master": {"replicas": 1, "restartPolicy": "Never",
                                                    "template": api.sanitize_for_serialization(template)}},
             },
@@ -344,13 +351,7 @@ class KJob:
     # ---------- lifecycle ----------
     def submit(self) -> str:
         if self.spec.gpus and self.spec.node and not self.spec.gpu_types:
-            try:
-                node = self.core.read_node(self.spec.node)
-            except ApiException as e:
-                if e.status == 403:
-                    raise ValueError("Cannot inspect the selected node; specify -g (e.g. a30 or a30-shared) together with -w.") from None
-                raise
-            labels = node.metadata.labels or {}
+            labels = self._node_labels(self.spec.node)
             if labels.get(SHARING_STRATEGY_LABEL) == "mps":
                 product = labels.get("nvidia.com/gpu.product", "")
                 if not product.endswith("-SHARED"):
@@ -373,7 +374,28 @@ class KJob:
         self._warn_unshared_paths()
         obj = self.custom.create_namespaced_custom_object(GROUP, VERSION, self.ns, PLURAL, self.manifest())
         self.uid = obj["metadata"]["uid"]
+        record_history(self)
         return self.spec.name
+
+    def _node_labels(self, name: str) -> dict:
+        """Labels of a pinned node: read directly, else from the published cluster status, else assume a whole-GPU node."""
+        try:
+            return self.core.read_node(name).metadata.labels or {}
+        except ApiException as e:
+            if e.status != 403:
+                raise
+        try:
+            node = next((n for n in cluster.load_snapshot(self.core)["nodes"] if n["name"] == name), None)
+        except (cluster.ClusterViewUnavailable, ApiException, ValueError):
+            node = None
+        if node is None:
+            print(f"kjob: cannot inspect node {name}; requesting whole GPUs there (use -g ...-shared for an MPS node)",
+                  file=sys.stderr)
+            return {}
+        labels = {SHARING_STRATEGY_LABEL: node["sharing"]} if node["sharing"] else {}
+        if node["product"]:
+            labels["nvidia.com/gpu.product"] = node["product"]
+        return labels
 
     def _warn_unshared_paths(self) -> None:
         shared = self.t.shared_paths()
@@ -528,6 +550,53 @@ class KJob:
         if cleanup:
             self.delete()
         return code
+
+
+HISTORY_FILE = Path.home() / ".kjob" / "history.jsonl"
+
+
+def record_history(job: "KJob") -> None:
+    """Append the submitted job to ~/.kjob/history.jsonl (read by `kjob acct`); failures are ignored."""
+    s = job.spec
+    rec = {"name": s.name, "namespace": job.ns, "submitted": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "gpus": s.gpus, "gpu_types": s.gpu_types, "node": s.node, "cpus": s.cpus, "memory": s.memory,
+           "time_limit": s.time_limit, "command": s.command()[:500], "log": s.log_path()}
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with HISTORY_FILE.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def read_history() -> list[dict]:
+    try:
+        lines = HISTORY_FILE.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def log_result(path: str) -> tuple[str | None, str | None, int | None]:
+    """(start, end, exit code) from the [kjob ...] lines the job wrapper writes into its log."""
+    start = end = code = None
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                m = re.match(r"\[kjob (\S+)\] (start|exit code (\d+))", line)
+                if m and m.group(2) == "start":
+                    start, end, code = m.group(1), None, None   # a rerun into the same log starts over
+                elif m:
+                    end, code = m.group(1), int(m.group(3))
+    except OSError:
+        pass
+    return start, end, code
 
 
 # ---------- namespace-level helpers (used by the CLI) ----------

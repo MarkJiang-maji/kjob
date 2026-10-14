@@ -1,15 +1,21 @@
-"""kjob command line: slurm-like commands for PyTorchJobs that mirror the current notebook.
+"""kjob command line: Slurm-like commands for PyTorchJobs that mirror the current notebook.
 
+Submitting and following your jobs
   kjob submit  [opts] SCRIPT [ARGS...]   like sbatch: submit and return (job deleted by TTL after it finishes)
   kjob run     [opts] SCRIPT [ARGS...]   like srun:   submit, stream output live, delete the job, exit with its code
   kjob wait    NAME                       follow a submitted job until it ends, then delete it
-  kjob queue   [--all] [-w]               like squeue: list jobs (use -w to refresh every few seconds)
+  kjob queue   [-A] [-w]                  like squeue: your jobs (-A: every GPU workload in the cluster)
+  kjob show    NAME                       like scontrol show job: resources, state, node, events, log file
   kjob logs    NAME [-f]                  print (or follow) a job's output; falls back to the saved log file
   kjob cancel  NAME... | --finished | --all-mine [--all-notebooks]   like scancel
   kjob clean   [--all-notebooks]          delete finished kjob jobs (same as cancel --finished)
-  kjob info                               like sinfo: what jobs inherit from the notebook, quota usage, GPU types
-Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, klogs, kcancel, kclean, kinfo.
---finished, --all-mine and clean only touch jobs submitted from this notebook unless --all-notebooks is given.
+  kjob acct    [-n N]                     like sacct: jobs you submitted, with exit code and run time
+Cluster and environment
+  kjob sinfo   [-g TYPE] [-w]             like sinfo: GPUs per type and node (total / used / free / waiting)
+  kjob info                               what jobs inherit from this notebook, quota usage
+  kjob install-skills [--dir DIR]         copy the kjob AI-assistant skills (default ~/.claude/skills)
+Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, kshow, klogs, kcancel, kclean, kacct,
+ksinfo, kinfo. Scripts may carry options in '#KJOB' or '#SBATCH' lines at the top; command-line options win.
 """
 
 from __future__ import annotations
@@ -17,25 +23,137 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
+import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
 
 from kubernetes.client.rest import ApiException
+from kubernetes.config import ConfigException
 from urllib3.exceptions import HTTPError
 
-from . import core
+from . import cluster, core
+
+SKILLS_DIR = Path(__file__).parent / "skills"
+
+
+# ---------- option parsing ----------
+def parse_time(value: str) -> int:
+    """Slurm time formats (MM, MM:SS, HH:MM:SS, D-HH, D-HH:MM, D-HH:MM:SS) or 90m / 12h / 2d, in seconds."""
+    v = value.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*([smhd])", v)
+    if m:
+        return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    days = 0
+    if "-" in v:
+        d, v = v.split("-", 1)
+        days = int(d)
+        parts = [int(x) for x in v.split(":")]
+        parts += [0] * (3 - len(parts))        # D-HH, D-HH:MM, D-HH:MM:SS
+        h, mi, s = parts
+    else:
+        parts = [int(x) for x in v.split(":")]
+        if len(parts) == 1:
+            h, mi, s = 0, parts[0], 0           # minutes
+        elif len(parts) == 2:
+            h, mi, s = 0, parts[0], parts[1]    # minutes:seconds
+        else:
+            h, mi, s = parts
+    total = days * 86400 + h * 3600 + mi * 60 + s
+    if total <= 0:
+        raise ValueError
+    return total
+
+
+def _time_arg(value: str) -> int:
+    try:
+        return parse_time(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid time {value!r} (examples: 30, 2:00:00, 1-12:00:00, 90m, 12h)")
+
+
+def _slurm_mem(v: str) -> str:
+    """Slurm sizes are binary: 32G -> 32Gi; a bare number is MiB."""
+    m = re.fullmatch(r"(\d+)([KMGT]?)B?", v.upper())
+    if not m:
+        return v
+    return m.group(1) + ({"": "M"}.get(m.group(2), m.group(2))) + "i"
+
+
+_SBATCH_SAME = {"-J": "-J", "--job-name": "-J", "-c": "-c", "--cpus-per-task": "-c", "-t": "-t", "--time": "-t",
+                "-w": "-w", "--nodelist": "-w", "-x": "-x", "--exclude": "-x", "-D": "-D", "--chdir": "-D"}
+
+
+def _translate_sbatch(tokens: list[str], warn) -> list[str]:
+    out, i = [], 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--") and "=" in tok:
+            key, val = tok.split("=", 1)
+        elif (tok in _SBATCH_SAME or tok in ("--mem", "--gres", "--gpus", "-G", "--gpus-per-node")) and i + 1 < len(tokens):
+            key, val = tok, tokens[i + 1]
+            i += 1
+        elif tok.startswith("-") and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            key, val = tok, tokens[i + 1]      # unknown option with a value, e.g. -p gp1d
+            i += 1
+        else:
+            key, val = tok, None
+        i += 1
+        if key in _SBATCH_SAME and val is not None:
+            out += [_SBATCH_SAME[key], val]
+        elif key == "--mem" and val:
+            out += ["--mem", _slurm_mem(val)]
+        elif key in ("--gpus", "-G", "--gpus-per-node") and val:
+            parts = val.split(":")
+            if len(parts) == 2:
+                out += ["-g", parts[0]]
+            out += ["-G", parts[-1]]
+        elif key == "--gres" and val and val.startswith("gpu"):
+            parts = val.split(":")          # gpu:N or gpu:TYPE:N
+            if len(parts) == 3:
+                out += ["-g", parts[1]]
+            out += ["-G", parts[-1] if len(parts) > 1 else "1"]
+        else:
+            warn(f"kjob: ignoring #SBATCH {tok}" + (f" {val}" if val is not None and "=" not in tok else ""))
+    return out
+
+
+def script_directives(script: str, warn=lambda m: print(m, file=sys.stderr)) -> list[str]:
+    """Options from '#KJOB ...' (kjob syntax) and '#SBATCH ...' lines before the first command of the script."""
+    try:
+        with open(script, errors="replace") as f:
+            lines = [next(f, "") for _ in range(200)]
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#!"):
+            continue
+        if not s.startswith("#"):
+            break                              # like sbatch: directives end at the first command
+        m = re.match(r"#\s*(KJOB|SBATCH)\s+(.*)", s)
+        if not m:
+            continue
+        tokens = shlex.split(m.group(2), comments=True)
+        out += tokens if m.group(1) == "KJOB" else _translate_sbatch(tokens, warn)
+    return out
 
 
 def _add_job_opts(p: argparse.ArgumentParser) -> None:
-    p.add_argument("-J", "--job-name", help="job name (default: script name + time)")
+    p.add_argument("-J", "--job-name", help="job name (default: script name + unique suffix)")
     p.add_argument("-G", "--gpus", type=int, default=1, help="GPUs (default 1; 0 for CPU-only)")
     p.add_argument("-c", "--cpus", type=int, default=core.DEFAULT_CPUS, help="CPU cores (default 1)")
-    p.add_argument("--mem", default=core.DEFAULT_MEMORY, help="memory (default 2Gi)")
-    p.add_argument("--shm", default=core.DEFAULT_SHM, help="/dev/shm size (default 256Mi)")
-    p.add_argument("-g", "--gpu-type", default="", help=f"comma list of GPU types: {', '.join(core.GPU_PRODUCTS)} or a raw nvidia.com/gpu.product")
-    p.add_argument("-w", "--nodelist", default=None, help="pin to this node (kubernetes.io/hostname)")
+    p.add_argument("--mem", default=core.DEFAULT_MEMORY, help="memory, e.g. 32Gi (default 2Gi)")
+    p.add_argument("--shm", default=core.DEFAULT_SHM, help="/dev/shm size, e.g. 8Gi (default 256Mi)")
+    p.add_argument("-g", "--gpu-type", default="", help=f"comma list of GPU types: {', '.join(core.GPU_PRODUCTS)}, a "
+                   "name shown by ksinfo, or a raw nvidia.com/gpu.product value")
+    p.add_argument("-w", "--nodelist", default=None, help="run on this node (kubernetes.io/hostname)")
     p.add_argument("-x", "--exclude", default="", help="comma list of nodes to avoid")
+    p.add_argument("-t", "--time", type=_time_arg, default=None,
+                   help="time limit; the job is stopped after it (30, 2:00:00, 1-12:00:00, 12h)")
     p.add_argument("--python", default=None, help="interpreter for the script (default: this Python for .py)")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra environment variable (repeatable)")
     p.add_argument("-D", "--chdir", default=None, help="working directory in the job (default: current directory)")
@@ -45,25 +163,80 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the script")
 
 
+def resolve_gpu_types(values: list[str], node: str | None, snapshot=None) -> tuple[list[str], str | None]:
+    """Map -g values to product labels. A name that only matches an unlabeled GPU node (e.g. rtxpro6000) becomes -w."""
+    out = []
+    for v in values:
+        label_like = v.split("-")[0] in ("NVIDIA", "Tesla", "Quadro")
+        if v in core.GPU_PRODUCTS:
+            out.append(v)
+            continue
+        try:
+            snap = snapshot if snapshot is not None else cluster.load_snapshot()
+        except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
+            if not label_like:
+                print(f"kjob: {v!r} is not a short GPU name ({', '.join(core.GPU_PRODUCTS)}); using it as the raw "
+                      "nvidia.com/gpu.product label", file=sys.stderr)
+            out.append(v)
+            continue
+        if label_like and any(n["product"] == v for n in snap.get("nodes", [])):
+            out.append(v)
+            continue
+        hits = [n for n in snap.get("nodes", []) if cluster.matches_type(v, n)]
+        products = sorted({n["product"] for n in hits if n["product"]})
+        unlabeled = sorted({n["name"] for n in hits if not n["product"]})
+        if products:
+            out += products
+        elif len(unlabeled) == 1 and len(values) == 1 and node in (None, unlabeled[0]):
+            node = unlabeled[0]
+        else:
+            raise ValueError(f"GPU type {v!r} matches no single GPU type; see ksinfo for the names.")
+    return out, node
+
+
 def _spec(a) -> core.JobSpec:
     name = a.job_name or core.unique_name(Path(a.script).stem)
     if any("=" not in e for e in a.env):
         raise ValueError("--env must be KEY=VALUE.")
     env = dict(e.split("=", 1) for e in a.env)
+    gpu_types, node = resolve_gpu_types([g for g in a.gpu_type.split(",") if g], a.nodelist)
     spec = core.JobSpec(name=name, script=a.script, args=a.args, gpus=a.gpus, cpus=a.cpus, memory=a.mem, shm=a.shm,
-                        gpu_types=[g for g in a.gpu_type.split(",") if g], node=a.nodelist,
+                        gpu_types=gpu_types, node=node,
                         exclude_nodes=[n for n in a.exclude.split(",") if n], interpreter=a.python, env=env,
                         workdir=str(Path(a.chdir or os.getcwd()).resolve()),
-                        log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl)
+                        log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl, time_limit=a.time)
     spec.validate()
     return spec
 
 
+# ---------- output helpers ----------
 def _age(ts: str | None) -> str:
     if not ts:
         return "-"
     s = int((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds())
+    return _dur(s)
+
+
+def _dur(s: int | None) -> str:
+    if s is None:
+        return "-"
     return f"{s // 86400}d{s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+def _table(hdr: list[str], rows: list[list]) -> None:
+    w = [max(len(str(r[i])) for r in rows + [hdr]) for i in range(len(hdr))]
+    print("  ".join(h.ljust(w[i]) for i, h in enumerate(hdr)).rstrip())
+    for r in rows:
+        print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)).rstrip())
+
+
+def _num(x: float) -> str:
+    return str(int(x)) if float(x).is_integer() else f"{x:.1f}"
+
+
+def _snapshot_banner(snap: dict) -> str:
+    src = "live" if snap.get("source") == "live" else f"published {_dur(cluster.snapshot_age(snap))} ago"
+    return f"cluster status ({src})"
 
 
 def _job_for(name: str) -> core.KJob:
@@ -77,6 +250,7 @@ def _job_for(name: str) -> core.KJob:
     return j
 
 
+# ---------- job commands ----------
 def cmd_submit(a) -> int:
     job = core.KJob(_spec(a))
     name = job.submit()
@@ -116,19 +290,96 @@ def _queue_rows(everyone: bool):
     return rows
 
 
+def _cluster_queue(a) -> None:
+    snap = cluster.load_snapshot()
+    nodes = {n["name"]: n for n in snap.get("nodes", [])}
+    mine = core.current_namespace()
+    rows = []
+    for w in snap.get("workloads", []):
+        gtype = cluster.workload_type(w, nodes)
+        if a.user and w["namespace"] not in a.user.split(","):
+            continue
+        if a.state and w["state"].lower() != a.state.lower():
+            continue
+        if a.gpu_type and not any(cluster.matches_type(a.gpu_type, n) for n in nodes.values()
+                                  if cluster.node_type(n) in gtype.split(",")):
+            continue
+        rows.append({**w, "type": gtype})
+    rows.sort(key=lambda w: (w["state"] != "Running", w["type"], -w["age_s"]))
+    print(_snapshot_banner(snap))
+    table = [[("*" if w["namespace"] == mine else "") + w["namespace"], w["kind"], w["name"], w["state"], w["gpus"],
+              w["type"], w["node"] or "-", _dur(w["age_s"]), w["reason"][:70]] for w in rows]
+    _table(["USER", "KIND", "NAME", "STATE", "GPU", "GPU_TYPE", "NODE", "TIME", "WAITING_FOR"], table)
+    run = [w for w in rows if w["state"] == "Running"]
+    pend = [w for w in rows if w["state"] == "Pending"]
+    print(f"running: {len(run)} workloads / {sum(w['gpus'] for w in run)} GPUs;  "
+          f"pending: {len(pend)} workloads / {sum(w['gpus'] for w in pend)} GPUs   (* = your namespace)")
+
+
 def cmd_queue(a) -> int:
     while True:
-        rows = _queue_rows(a.all)
-        hdr = ["NAME", "STATE", "NOTEBOOK", "POD", "NODE", "GPU", "CPU", "AGE", "COMMAND"]
-        w = [max(len(str(r[i])) for r in rows + [hdr]) for i in range(len(hdr))]
         if a.watch:
             print("\033[2J\033[H", end="")
-        print("  ".join(h.ljust(w[i]) for i, h in enumerate(hdr)))
-        for r in rows:
-            print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)))
+        if a.all_users or a.user:
+            _cluster_queue(a)
+        else:
+            _table(["NAME", "STATE", "NOTEBOOK", "POD", "NODE", "GPU", "CPU", "AGE", "COMMAND"], _queue_rows(a.all))
         if not a.watch:
             return 0
         time.sleep(5)
+
+
+def cmd_show(a) -> int:
+    j = _job_for(a.name)
+    try:
+        o = j.custom.get_namespaced_custom_object(core.GROUP, core.VERSION, j.ns, core.PLURAL, a.name)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        rec = next((r for r in reversed(core.read_history()) if r["name"] == a.name), None)
+        if not rec:
+            print(f"kjob: no job {a.name} in namespace {j.ns} and no history record", file=sys.stderr)
+            return 1
+        start, end, code = core.log_result(rec["log"])
+        print(f"JobName={a.name}  (deleted from the cluster; from ~/.kjob/history.jsonl)")
+        for k in ("submitted", "gpus", "gpu_types", "node", "cpus", "memory", "time_limit", "command", "log"):
+            print(f"  {k:12s} {rec.get(k)}")
+        print(f"  {'started':12s} {start or '-'}\n  {'ended':12s} {end or '-'}\n  {'exit code':12s} {code if code is not None else '-'}")
+        return 0
+    meta, spec = o["metadata"], o["spec"]
+    ann = meta.get("annotations") or {}
+    pod_spec = spec["pytorchReplicaSpecs"]["Master"]["template"]["spec"]
+    c = pod_spec["containers"][0]
+    res = (c.get("resources") or {}).get("requests", {})
+    terms = ((((pod_spec.get("affinity") or {}).get("nodeAffinity") or {})
+              .get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or [{}])[0]
+    rp = spec.get("runPolicy") or {}
+    print(f"JobName={a.name}  Namespace={j.ns}  State={core.job_state(o)}")
+    print(f"  submitted    {ann.get('kjob/submitted', meta.get('creationTimestamp'))}  (age {_age(meta.get('creationTimestamp'))})")
+    print(f"  notebook     {(meta.get('labels') or {}).get('kjob/notebook', '-')}")
+    print(f"  command      {ann.get('kjob/command', '-')}")
+    print(f"  workdir      {ann.get('kjob/workdir', '-')}")
+    print(f"  log          {ann.get('kjob/log', '-')}")
+    print(f"  resources    gpu={res.get('nvidia.com/gpu', '0')} cpu={res.get('cpu')} mem={res.get('memory')} image={c.get('image')}")
+    for e in terms.get("matchExpressions", []):
+        print(f"  constraint   {e['key']} {e['operator']} {','.join(e.get('values', []))}")
+    print(f"  time limit   {_dur(rp.get('activeDeadlineSeconds')) if rp.get('activeDeadlineSeconds') else 'none'}"
+          f"   kept after end {str(rp['ttlSecondsAfterFinished']) + 's' if 'ttlSecondsAfterFinished' in rp else '-'}")
+    for cond in (o.get("status") or {}).get("conditions") or []:
+        print(f"  condition    {cond['type']}={cond['status']} {cond.get('reason', '')} {cond.get('message', '')[:120]}")
+    try:
+        pod = j._pod()
+        print(f"  pod          {pod.status.phase} on {pod.spec.node_name or '-'} (started {pod.status.start_time or '-'})")
+        code = j.exit_code()
+        if code is not None:
+            print(f"  exit code    {code} ({getattr(j, 'exit_reason', '')})")
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        print("  pod          not created yet or already removed")
+    for ev in core.job_events(j.ns, a.name, uid=meta.get("uid")) + core.job_events(j.ns, j.pod_name):
+        print(f"  event        {ev[:160]}")
+    return 0
 
 
 def cmd_logs(a) -> int:
@@ -177,6 +428,106 @@ def cmd_cancel(a) -> int:
     return 0
 
 
+def cmd_acct(a) -> int:
+    hist = core.read_history()[-a.n:] if a.n else core.read_history()
+    try:
+        live = {o["metadata"]["name"]: core.job_state(o) for o in core.list_jobs()}
+    except (ApiException, HTTPError, ConfigException):
+        live = {}              # history still works without cluster access
+    rows = []
+    for r in hist:
+        start, end, code = core.log_result(r.get("log", ""))
+        if code is not None:
+            state = "COMPLETED" if code == 0 else "FAILED"
+        elif r["name"] in live:
+            state = live[r["name"]].upper()
+        else:
+            state = "ENDED?"       # cancelled, stopped by the time limit, or never started
+        elapsed = None
+        if start:
+            t1 = dt.datetime.fromisoformat((end or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")).replace("Z", "+00:00"))
+            elapsed = int((t1 - dt.datetime.fromisoformat(start.replace("Z", "+00:00"))).total_seconds())
+        where = ",".join(r.get("gpu_types") or []) or r.get("node") or ("cpu" if not r.get("gpus") else "any")
+        rows.append([r["name"], r["submitted"].replace("T", " ")[:16], r.get("gpus", 0), where, state,
+                     code if code is not None else "-", _dur(elapsed)])
+    _table(["NAME", "SUBMITTED(UTC)", "GPU", "GPU_TYPE/NODE", "STATE", "EXIT", "ELAPSED"], rows)
+    return 0
+
+
+# ---------- cluster / environment ----------
+def _my_tolerations() -> list | None:
+    """Tolerations a job from this notebook gets from the namespace PodDefaults (None when unknown)."""
+    try:
+        ns = core.current_namespace()
+        api = core.client.CoreV1Api()
+        labels = api.read_namespaced_pod(core.current_notebook(), ns).metadata.labels or {}
+        pds = core.client.CustomObjectsApi().list_namespaced_custom_object("kubeflow.org", "v1alpha1", ns, "poddefaults")["items"]
+    except (ApiException, HTTPError, ValueError):
+        return None
+    return [t for pd in pds if core._matches(pd["spec"].get("selector", {}), labels)
+            for t in pd["spec"].get("tolerations", [])]
+
+
+def _tolerated(taint: str, tolerations: list) -> bool:
+    key, _, value = taint.partition("=")
+    return any(t.get("key") == key and (t.get("operator") == "Exists" or t.get("value", "") == value)
+               for t in tolerations)
+
+
+def cmd_sinfo(a) -> int:
+    while True:
+        if a.watch:
+            print("\033[2J\033[H", end="")
+        _sinfo(a)
+        if not a.watch:
+            return 0
+        time.sleep(10)
+
+
+def _sinfo(a) -> None:
+    snap = cluster.load_snapshot()
+    nodes = [n for n in snap.get("nodes", []) if not a.gpu_type or cluster.matches_type(a.gpu_type, n)]
+    by_name = {n["name"]: n for n in snap.get("nodes", [])}
+    tol = _my_tolerations()
+    types = {}
+    for n in nodes:
+        t = types.setdefault(cluster.node_type(n), {"nodes": 0, "gpus": 0, "used": 0, "free": 0, "mem": n["memory_mib"],
+                                                     "restricted": set(), "pend": 0, "pend_jobs": 0})
+        t["nodes"] += 1
+        t["gpus"] += n["gpus"]
+        t["used"] += n["gpus_used"]
+        if n["ready"] and n["schedulable"]:
+            t["free"] += max(n["gpus"] - n["gpus_used"], 0)
+        t["restricted"] |= set(n["restricted"])
+    for w in snap.get("workloads", []):
+        if w["state"] == "Pending" and w["gpus"]:
+            for tname in cluster.workload_type(w, by_name).split(","):
+                if tname in types:
+                    types[tname]["pend"] += w["gpus"]
+                    types[tname]["pend_jobs"] += 1
+    print(_snapshot_banner(snap))
+    rows = []
+    for name, t in sorted(types.items()):
+        note = ""
+        if t["restricted"]:
+            ok = None if tol is None else all(_tolerated(x, tol) for x in t["restricted"])
+            note = "restricted" + ("" if ok is None else " (your namespace: allowed)" if ok else " (your namespace: no access)")
+        rows.append([name, t["nodes"], t["gpus"], t["used"], t["free"], f"{t['pend']} ({t['pend_jobs']} jobs)" if t["pend"] else "-",
+                     f"{round(t['mem'] / 1024)}GB" if t["mem"] else "-", note])
+    _table(["GPU_TYPE", "NODES", "GPUS", "USED", "FREE", "WAITING_GPUS", "GPU_MEM", "NOTE"], rows)
+    print()
+    rows = [[n["name"], cluster.node_type(n), f"{n['gpus_used']}/{n['gpus']}", f"{_num(n['cpus_used'])}/{_num(n['cpus'])}",
+             f"{_num(n['memory_used_gib'])}/{_num(n['memory_gib'])}",
+             ("up" if n["ready"] else "down") + ("" if n["schedulable"] else ",drain")] for n in nodes]
+    _table(["NODE", "GPU_TYPE", "GPU(used/total)", "CPU(req/total)", "MEM_GiB(req/total)", "STATE"], rows)
+    pend_any = [w for w in snap.get("workloads", []) if w["state"] == "Pending" and cluster.workload_type(w, by_name) == "any"]
+    if pend_any and not a.gpu_type:
+        print(f"\nwaiting without a GPU type: {len(pend_any)} workloads / {sum(w['gpus'] for w in pend_any)} GPUs")
+    if a.gpu_type:
+        print()
+        _cluster_queue(argparse.Namespace(user=None, state=None, gpu_type=a.gpu_type))
+
+
 def cmd_info(a) -> int:
     t = core.NotebookTemplate.from_current_pod()
     print(f"notebook  {t.pod_name}  (namespace {t.namespace}, node {t.node})")
@@ -192,11 +543,30 @@ def cmd_info(a) -> int:
     print("quota (used / hard):")
     for k, used, hard in core.quota():
         print(f"  {k:28s} {used} / {hard}")
-    print("GPU types for -g:", ", ".join(f"{k}={v}" for k, v in core.GPU_PRODUCTS.items()))
+    print("GPU type short names for -g:", ", ".join(f"{k}={v}" for k, v in core.GPU_PRODUCTS.items()))
+    print("cluster GPU types and free GPUs: ksinfo")
     return 0
 
 
-def main(argv=None) -> int:
+def cmd_install_skills(a) -> int:
+    dest = Path(a.dir).expanduser()
+    for src in sorted(SKILLS_DIR.glob("*/SKILL.md")):
+        target = dest / src.parent.name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+        print(f"installed {target}")
+    return 0
+
+
+def cmd_publish_status(a) -> int:
+    if a.once:
+        cluster.publish(cluster.build_snapshot(hide_names=a.hide_names))
+        return 0
+    cluster.publish_loop(a.interval, hide_names=a.hide_names, report=lambda m: print(m, flush=True))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="kjob", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn, help_ in [("submit", cmd_submit, "submit and return (sbatch)"), ("run", cmd_run, "submit, stream output, clean up (srun)")]:
@@ -207,10 +577,17 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p.add_argument("--keep", action="store_true", help="do not delete the job when it ends")
     p.set_defaults(fn=cmd_wait)
-    p = sub.add_parser("queue", help="list jobs (squeue)")
-    p.add_argument("--all", action="store_true", help="include PyTorchJobs not created by kjob")
+    p = sub.add_parser("queue", help="list your jobs, or every GPU workload with -A (squeue)")
+    p.add_argument("-A", "--all-users", action="store_true", help="every GPU workload in the cluster, all users")
+    p.add_argument("-u", "--user", default=None, help="with -A: only these namespaces (comma list); implies -A")
+    p.add_argument("--state", choices=["running", "pending"], help="with -A: only running or only pending")
+    p.add_argument("-g", "--gpu-type", default=None, help="with -A: only this GPU type / node (e.g. v100, rtxpro6000)")
+    p.add_argument("--all", action="store_true", help="also list PyTorchJobs in your namespace not created by kjob")
     p.add_argument("-w", "--watch", action="store_true", help="refresh every 5 s")
     p.set_defaults(fn=cmd_queue)
+    p = sub.add_parser("show", help="details of one job (scontrol show job)")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_show)
     p = sub.add_parser("logs", help="print or follow a job's output")
     p.add_argument("name")
     p.add_argument("-f", "--follow", action="store_true")
@@ -226,16 +603,48 @@ def main(argv=None) -> int:
     p.add_argument("--all-notebooks", action="store_true", help="include jobs from other notebooks")
     p.set_defaults(fn=lambda a: cmd_cancel(argparse.Namespace(names=[], finished=True, all_mine=False,
                                                               all_notebooks=a.all_notebooks)))
-    p = sub.add_parser("info", help="show inherited environment, quota and GPU types (sinfo)")
+    p = sub.add_parser("acct", help="jobs you submitted, with exit code and run time (sacct)")
+    p.add_argument("-n", type=int, default=20, help="last N jobs (default 20, 0 = all)")
+    p.set_defaults(fn=cmd_acct)
+    p = sub.add_parser("sinfo", help="GPU types and nodes: total / used / free / waiting (sinfo)")
+    p.add_argument("-g", "--gpu-type", default=None, help="only this GPU type or node, and list its workloads")
+    p.add_argument("-w", "--watch", action="store_true", help="refresh every 10 s")
+    p.set_defaults(fn=cmd_sinfo)
+    p = sub.add_parser("info", help="what jobs inherit from this notebook, quota usage")
     p.set_defaults(fn=cmd_info)
+    p = sub.add_parser("install-skills", help="install the kjob skills for AI coding assistants")
+    p.add_argument("--dir", default="~/.claude/skills", help="skills directory (default ~/.claude/skills)")
+    p.set_defaults(fn=cmd_install_skills)
+    p = sub.add_parser("publish-status", help="(administrators) publish the cluster status ConfigMap")
+    p.add_argument("--interval", type=int, default=30, help="seconds between updates")
+    p.add_argument("--once", action="store_true", help="publish once and exit")
+    p.add_argument("--hide-names", action="store_true", help="publish namespaces but not workload names")
+    p.set_defaults(fn=cmd_publish_status)
+    return ap
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = build_parser()
     a = ap.parse_args(argv)
-    core._load_config()
+    if a.cmd in ("submit", "run"):
+        extra = script_directives(a.script)
+        if extra:
+            a = ap.parse_args(argv[:1] + extra + argv[1:])   # later (command-line) options override directives
     if getattr(a, "args", None) and a.args[:1] == ["--"]:
         a.args = a.args[1:]
+    if a.cmd in ("install-skills", "acct"):
+        return a.fn(a)
+    try:
+        core._load_config()
+    except ConfigException:
+        ap.exit(1, "kjob: no Kubernetes access; run kjob inside a Kubeflow Notebook (or set KUBECONFIG)\n")
     try:
         return a.fn(a)
     except ValueError as e:
         ap.error(str(e))
+    except cluster.ClusterViewUnavailable as e:
+        ap.exit(1, f"kjob: {e}\n")
     except ApiException as e:
         ap.exit(1, f"kjob: Kubernetes API error ({e.status}): {e.reason}\n")
     except HTTPError as e:  # connection refused/reset, timeouts: the job itself is unaffected
@@ -248,7 +657,10 @@ def ksub() -> int: return main(["submit", *sys.argv[1:]])
 def ksrun() -> int: return main(["run", *sys.argv[1:]])
 def kwait() -> int: return main(["wait", *sys.argv[1:]])
 def kqueue() -> int: return main(["queue", *sys.argv[1:]])
+def kshow() -> int: return main(["show", *sys.argv[1:]])
 def klogs() -> int: return main(["logs", *sys.argv[1:]])
 def kcancel() -> int: return main(["cancel", *sys.argv[1:]])
 def kclean() -> int: return main(["clean", *sys.argv[1:]])
+def kacct() -> int: return main(["acct", *sys.argv[1:]])
+def ksinfo() -> int: return main(["sinfo", *sys.argv[1:]])
 def kinfo() -> int: return main(["info", *sys.argv[1:]])

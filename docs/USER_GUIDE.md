@@ -1,0 +1,264 @@
+# kjob 使用手冊（完整功能）
+
+新手請先看 [TRIAL_GUIDE.md](../TRIAL_GUIDE.md)。本手冊列出所有指令與選項。
+
+* [運作方式](#運作方式)
+* [安裝與更新](#安裝與更新)
+* [提交工作：ksub / ksrun](#提交工作ksub--ksrun)
+* [腳本內設定：#SBATCH / #KJOB](#腳本內設定sbatch--kjob)
+* [查看與管理自己的工作](#查看與管理自己的工作)
+* [查看整個叢集：ksinfo / kqueue -A](#查看整個叢集ksinfo--kqueue--a)
+* [GPU 型號、受限節點與共享 GPU](#gpu-型號受限節點與共享-gpu)
+* [排隊與錯誤排解](#排隊與錯誤排解)
+* [AI 助手 skill](#ai-助手-skill)
+* [Python API](#python-api)
+* [檔案與環境變數](#檔案與環境變數)
+* [限制](#限制)
+
+## 運作方式
+
+`ksub` 讀取你目前 Notebook Pod 的設定，建立一個 Kubeflow PyTorchJob：
+
+* **image、工作目錄、使用者／群組設定**與 Notebook 相同。
+* **磁碟**：Notebook 主容器掛載的磁碟都會帶過去（`/home/jovyan`、群組資料夾、共用 NFS）。底層是 NFS 的
+  ReadWriteOnce 工作磁碟會改用 NFS 直接掛載，所以工作可以跑在別的節點。
+  * 不會複製：service account token、Istio sidecar、namespace PodDefault 會自動加上的磁碟（PodDefault 會再加一次）、
+    舊的群組資料夾（`gs-*`、`ns-*`，由 PodDefault 加上目前的版本）。
+  * `emptyDir`（例如 `/dev/shm`）在工作裡是新的空目錄；Notebook 的 `/tmp` 工作看不到。
+  * `kinfo` 會列出實際會帶過去的內容。
+* namespace 的 **PodDefault**（例如共用 NFS、受限 GPU 節點的 toleration）也會套用到工作。
+* 工作的輸出用 `tee` 同時寫到 Pod log 和 `~/kjob-logs/NAME.log`。
+* 工作結束後 Pod 保留供查看，工作物件在 `--ttl` 秒後自動刪除；`ksrun`、`kwait` 會在結束時直接刪除。
+
+## 安裝與更新
+
+```bash
+python3 -m pip install --user --upgrade https://github.com/MarkJiang-maji/kjob/archive/refs/heads/cgu-public.tar.gz
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+| 情況 | 指令 |
+|---|---|
+| 有 git，想用 git 安裝 | `python3 -m pip install --user --upgrade 'git+https://github.com/MarkJiang-maji/kjob.git@cgu-public'` |
+| 固定某個版本 | 把網址中的 `refs/heads/cgu-public` 換成 commit SHA：`.../archive/<sha>.tar.gz` |
+| 虛擬環境內 | 啟用環境後執行 `python -m pip install --upgrade ...`（不加 `--user`） |
+| 沒有網路，用管理員給的 wheel | `python3 -m pip install --user kjob-0.4.0-py3-none-any.whl` |
+| 從原始碼開發 | `git clone ...; python3 -m pip install --user -e kjob` |
+| 移除 | `python3 -m pip uninstall kjob` |
+
+需要 Python 3.8 以上與 `kubernetes` Python 套件（pip 會自動安裝）。每個指令也可以寫成 `kjob 子指令`，例如
+`kjob submit` = `ksub`、`kjob sinfo` = `ksinfo`、`python3 -m kjob queue` = `kqueue`。
+
+## 提交工作：ksub / ksrun
+
+```text
+ksub  [選項] 腳本 [腳本參數...]     提交後返回（≈ sbatch）
+ksrun [選項] 腳本 [腳本參數...]     提交、即時輸出、結束後刪除工作、回傳程式的結束代碼（≈ srun）
+```
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `-J, --job-name NAME` | 腳本名 + 隨機字尾 | 工作名稱，只能用小寫英數與 `-`，最多 50 字元；同名工作已存在會失敗 |
+| `-G, --gpus N` | `1` | GPU 數；`0` 代表只用 CPU（工作看不到任何 GPU） |
+| `-g, --gpu-type TYPE[,TYPE]` | 任何整張 GPU | GPU 型號，見 [GPU 型號](#gpu-型號受限節點與共享-gpu) |
+| `-w, --nodelist NODE` | — | 指定節點（Kubernetes 節點名稱，`ksinfo` 的 NODE 欄） |
+| `-x, --exclude NODE[,NODE]` | — | 避開節點 |
+| `-c, --cpus N` | `1` | CPU 核心數（requests = limits） |
+| `--mem SIZE` | `2Gi` | 記憶體上限，Kubernetes 格式：`512Mi`、`32Gi`。超過會被 OOMKilled |
+| `--shm SIZE` | `256Mi` | `/dev/shm` 大小；PyTorch DataLoader 多 worker 時建議 `8Gi` 以上 |
+| `-t, --time TIME` | 無 | 時間上限，時間到工作被停止。格式：`30`（分）、`30:00`（分:秒）、`2:00:00`、`1-12`（天-時）、`1-12:30:00`、`90m`、`12h`、`2d` |
+| `--python PATH` | 目前的 python3 | 執行 `.py` 用的直譯器，例如 `/home/jovyan/venv/bin/python` |
+| `--env KEY=VALUE` | — | 額外環境變數，可重複；`KJOB_*`、`NVIDIA_VISIBLE_DEVICES` 等保留變數不能覆蓋 |
+| `-D, --chdir DIR` | 目前目錄 | 工作的工作目錄 |
+| `-o, --log-dir DIR` | `~/kjob-logs` | 日誌存放處，必須在可寫入的共用磁碟 |
+| `--ttl SECONDS` | `3600` | 工作結束且沒人監看時，工作物件保留多久才自動刪除 |
+
+腳本類型：`.py` 用 Python 執行，`.sh` 用 bash，其他檔案直接執行（需要執行權限）。腳本參數若長得像 kjob 選項，
+前面加 `--`：`ksub -G 1 train.py -- -c config.yaml`。
+
+提交前的檢查（不通過就不會建立工作）：
+
+* 腳本、工作目錄、日誌目錄必須在共用磁碟，日誌目錄必須可寫。
+* 要求的 CPU／記憶體／GPU 超過 namespace 配額的**上限**時直接報錯（暫時被占滿則會排隊等候）。
+* GPU 數、記憶體格式、環境變數名稱。
+
+`ksrun` 的行為：
+
+* 排隊時顯示排程訊息（例如 GPU 不足），開始後即時輸出，結束時印出 `Succeeded/Failed (exit code N)`。
+* 結束代碼就是程式的結束代碼，可用在 shell 腳本：`ksrun ... && echo ok`。
+* Ctrl-C 會**取消**工作。連線中斷時工作不受影響，之後用 `kqueue`、`kwait` 查看。
+
+## 腳本內設定：#SBATCH / #KJOB
+
+在腳本開頭（第一個指令之前）的註解行設定選項，命令列選項優先：
+
+```bash
+#!/bin/bash
+#KJOB -G 2 -g v100 --shm 16Gi          # kjob 的選項，原樣使用
+#SBATCH --mem=64G -t 1-00:00:00         # 國網語法，轉換如下表
+python3 train.py
+```
+
+| #SBATCH | 轉成 |
+|---|---|
+| `-J`、`--job-name` | `-J` |
+| `-c`、`--cpus-per-task` | `-c` |
+| `--mem=64G`（無單位 = MB） | `--mem 64Gi` |
+| `-t`、`--time` | `-t` |
+| `--gres=gpu:N`、`--gres=gpu:TYPE:N` | `-G N`（`-g TYPE`） |
+| `--gpus=N`、`--gpus=TYPE:N`、`-G`、`--gpus-per-node` | `-G N`（`-g TYPE`） |
+| `-w`、`--nodelist`、`-x`、`--exclude`、`-D`、`--chdir` | 同名選項 |
+| 其他（`-p`、`-A`、`-o`、`-e`、`-N`、`-n`、`--ntasks`、`--mail-*` ...） | 忽略並顯示警告 |
+
+## 查看與管理自己的工作
+
+| 指令 | 說明 |
+|---|---|
+| `kqueue` | 自己 namespace 由 kjob 建立的工作：NAME、STATE、提交的 NOTEBOOK、POD 狀態、NODE、GPU、CPU、AGE、COMMAND |
+| `kqueue --all` | 也列出 namespace 內不是 kjob 建立的 PyTorchJob |
+| `kqueue -w` | 每 5 秒更新 |
+| `kshow NAME` | 詳細資訊：提交時間、指令、工作目錄、日誌、資源、節點限制、時間上限、狀態條件、Pod、最近的警告事件。工作已刪除時改顯示歷史紀錄 |
+| `klogs NAME` | 印出輸出；Pod 已不在時改讀日誌檔 |
+| `klogs NAME -f` | 即時跟隨輸出；Ctrl-C 只停止觀看 |
+| `klogs NAME -o DIR` | 日誌不在預設位置時指定目錄 |
+| `kwait NAME` | 等到結束（排隊中會顯示原因），回傳程式的結束代碼，結束後刪除工作物件 |
+| `kwait NAME --keep` | 同上，但不刪除工作物件 |
+| `kacct` | 最近 20 筆提交紀錄：提交時間、GPU、型號/節點、STATE（COMPLETED/FAILED/RUNNING/PENDING/ENDED?）、EXIT、ELAPSED |
+| `kacct -n 0` | 全部紀錄（`-n N` 最近 N 筆） |
+| `kcancel NAME [NAME...]` | 取消／刪除工作 |
+| `kcancel --finished` | 刪除這個 Notebook 提交、已結束的工作 |
+| `kcancel --all-mine` | 刪除這個 Notebook 提交的**所有**工作（包含執行中） |
+| `kcancel ... --all-notebooks` | 配合上兩項，包含同 namespace 其他 Notebook 提交的工作 |
+| `kclean [--all-notebooks]` | 等於 `kcancel --finished` |
+| `kinfo` | Notebook 名稱、namespace、image、工作目錄、會帶過去的磁碟、沒帶過去的磁碟與原因、配額使用量 |
+
+`kacct` 的 `ENDED?` 表示工作已不存在、日誌也沒有結束代碼：被取消、超過時間上限，或從未開始。
+
+## 查看整個叢集：ksinfo / kqueue -A
+
+Notebook 本身沒有讀取其他 namespace 的權限，這些資訊來自管理員啟用的叢集狀態服務（每 30 秒更新，畫面上會寫
+`published Ns ago`）。管理員帳號則直接讀取即時資料（`live`）。
+
+### ksinfo
+
+```text
+ksinfo              # 每種 GPU 型號一列，加上每個節點一列
+ksinfo -g v100      # 只看某型號或節點，並列出在上面跑／在等它的工作
+ksinfo -w           # 每 10 秒更新
+```
+
+| 欄位 | 意義 |
+|---|---|
+| GPUS / USED / FREE | 總數 / 已被申請 / 可用（節點故障或停用排程時不算可用） |
+| WAITING_GPUS | 正在等這種 GPU 的工作要求的 GPU 總數與工作數 |
+| GPU_MEM | 每張 GPU 的記憶體 |
+| NOTE | `restricted`：受限節點；`(your namespace: allowed / no access)`：你的 namespace 能不能用 |
+| CPU / MEM_GiB | 節點上已被申請 / 可分配的 CPU 和記憶體 |
+| STATE | `up`、`down`（節點故障）、`drain`（停用排程） |
+
+### kqueue -A
+
+| 指令 | 說明 |
+|---|---|
+| `kqueue -A` | 叢集上所有使用 GPU 的工作與 Notebook，以及所有 PyTorchJob |
+| `kqueue -A --state pending` | 只看排隊中的（`--state running` 只看執行中） |
+| `kqueue -A -g rtxpro6000` | 只看某型號／節點 |
+| `kqueue -u m1461023[,d000018238]` | 只看某些 namespace（使用者） |
+| `kqueue -A -w` | 每 5 秒更新 |
+
+欄位：USER（namespace，`*` 為自己的）、KIND（`Notebook`、`kjob`、`PyTorchJob`、`Pod`）、NAME、STATE、GPU、
+GPU_TYPE（排隊中的顯示它要求的型號，沒指定則為 `any`）、NODE、TIME（執行或等待時間）、WAITING_FOR（排程器說明的等待原因）。
+最後一行是執行中／排隊中的總數。
+
+## GPU 型號、受限節點與共享 GPU
+
+`-g` 可以用：
+
+1. 簡稱：`v100`、`a5000`、`a30`（整張）、`a30-shared`（MPS 共享）。
+2. `ksinfo` 顯示的名稱或其中一段，不分大小寫：`rtx-a5000`、`Tesla-V100-SXM2-16GB`、`rtxpro6000`。
+   沒有型號標籤的節點（例如 `rtxpro6000`）會自動改成 `-w 節點名稱`。需要叢集狀態服務。
+3. 原始的 `nvidia.com/gpu.product` 標籤值。
+4. 逗號分隔多個型號：`-g v100,a5000` 表示任一種都可以。
+
+不指定 `-g` 時，排程器會挑任何一張空的整張 GPU（自動避開 MPS 共享節點）。
+
+**受限節點**（`ksinfo` 顯示 `restricted`）：只有管理員開通的 namespace 能使用，開通後工作會自動帶上權限，直接用
+`-g` 或 `-w` 指定即可。沒開通的 namespace 提交後會一直排隊，原因是 `untolerated taint`。
+
+**MPS 共享 GPU**（`-g a30-shared`，只在有設定 MPS 的叢集）：多個工作分用一張 GPU。只能 `-G 1`，不能與整張 GPU
+型號混用，目前只允許 root（UID 0）Notebook 使用，且 MPS 服務需由管理員確認正常。一般建議使用整張 GPU。
+
+**配額**：namespace 配額（`kinfo` 的 quota）計算所有 Pod，包括 Notebook 本身占的 GPU 與排隊中的工作。
+GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
+
+## 排隊與錯誤排解
+
+排隊原因看 `kshow NAME`、`kwait` 的訊息或 `kqueue -A` 的 WAITING_FOR：
+
+| 訊息 | 意義 | 處理 |
+|---|---|---|
+| `Insufficient nvidia.com/gpu` | 該型號沒有空的 GPU | 等候，或換 `ksinfo` 中有空位的型號 |
+| `didn't match Pod's node affinity/selector` | `-g`/`-w` 組合找不到符合的節點 | 確認 `ksinfo` 中的名稱 |
+| `untolerated taint` | 受限節點，沒有權限 | 改用其他型號，或請管理員開通 |
+| `exceeded quota` | namespace 配額已滿 | 關閉閒置的 GPU Notebook、取消其他工作，或等候 |
+| `Insufficient cpu` / `memory` | 節點 CPU／記憶體不夠 | 降低 `-c`、`--mem` |
+| `ErrImagePull` | image 拉不下來 | 回報管理員 |
+
+執行失敗：
+
+| 現象 | 原因／處理 |
+|---|---|
+| `exit code 137, OOMKilled` | 記憶體超過 `--mem` |
+| `Bus error`、`DataLoader worker ... killed` | `/dev/shm` 太小，加大 `--shm` |
+| `CUDA out of memory` | 降低 batch size，或換記憶體大的 GPU |
+| `No such file or directory` | 檔案不在共用磁碟、或用了相對路徑 |
+| `ModuleNotFoundError` | 套件只裝在 Notebook 系統目錄；改用 `pip install --user` 或 `/home/jovyan` 上的虛擬環境 + `--python` |
+| `kshow` 顯示 `DeadlineExceeded` | 超過 `-t` 時間上限 |
+| `cuda: False` | 用了 `-G 0`，或 image／環境沒有 CUDA 版 PyTorch |
+
+## AI 助手 skill
+
+| Skill | 內容 |
+|---|---|
+| [kjob-install](../kjob/skills/kjob-install/SKILL.md) | 在 Notebook 安裝、驗證、更新 kjob，常見安裝問題 |
+| [kjob-jobs](../kjob/skills/kjob-jobs/SKILL.md) | 選 GPU、準備腳本、提交、監看、排錯；規定 AI 只能動使用者自己的工作 |
+
+```bash
+kjob install-skills                       # 安裝到 ~/.claude/skills（Claude Code）
+kjob install-skills --dir ~/.codex/skills # 其他支援 SKILL.md 的工具
+```
+
+不支援 skill 的 AI 工具，可以把這兩個 `SKILL.md` 的內容貼給它當說明。
+
+## Python API
+
+```python
+from kjob import JobSpec, KJob
+
+job = KJob(JobSpec(name="probe-1", script="/home/jovyan/linear_probe.py", args=["--lr", "0.01"],
+                   gpus=1, cpus=4, memory="24Gi", shm="8Gi", gpu_types=["v100"], time_limit=7200,
+                   interpreter="/home/jovyan/venv/bin/python"))
+code = job.run()          # 提交、即時輸出、刪除；回傳結束代碼
+# 或 job.submit(); ...; job.follow(); job.delete()
+```
+
+`JobSpec` 欄位：`name`、`script`、`args`、`gpus`、`cpus`、`memory`、`shm`、`gpu_types`、`node`、`exclude_nodes`、
+`interpreter`、`env`、`workdir`、`log_dir`、`ttl_seconds`、`time_limit`。
+
+## 檔案與環境變數
+
+| 位置 | 內容 |
+|---|---|
+| `~/kjob-logs/NAME.log` | 每個工作的完整輸出，第一行是開始時間與節點，最後一行是結束代碼 |
+| `~/.kjob/history.jsonl` | 提交紀錄（`kacct`、`kshow` 使用） |
+
+工作內可用的環境變數：`KJOB_NAME`（工作名稱）、`KJOB_NODE`（執行的節點）、`PYTHONUNBUFFERED=1`。
+GPU 工作的 `CUDA_VISIBLE_DEVICES` 由系統設定；`-G 0` 的工作看不到 GPU。
+
+## 限制
+
+* 沿用 Notebook 的 image，不能另外指定；只裝在 Notebook 系統目錄的套件工作看不到。
+* 單一 Pod：一個工作就是一台節點上的一個容器，多 GPU 請在腳本內用 `torchrun`，不支援跨節點分散式訓練。
+* 不支援 job array、`--dependency`、`sattach`、email 通知。
+* 排隊由 Kubernetes 排程器處理，不是嚴格先到先得，也沒有公平分享（fair share）。
+* kjob 的檢查是方便使用者的提示，不取代叢集本身的權限與配額控制。
