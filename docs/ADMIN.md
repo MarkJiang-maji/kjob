@@ -42,7 +42,8 @@ kubectl delete -f deploy/cluster-status.yaml           # 完整移除
 * 隱私：namespace 通常是學號／員工編號，所有 Notebook 都看得到。在 Deployment 的指令加上 `--hide-names`，
   就不公開工作／Notebook 名稱，排隊原因中引號內的名稱（例如其他人的 PVC 名稱）也會遮掉。
 * 安全：收集者可以讀全叢集的 Pod spec（含環境變數），所以 `KJOB_SOURCE` 固定在一個審過的 commit
-  （`archive/<sha>.tar.gz`），升級時刻意改 SHA；也可以改用預裝 kjob 的 image。
+  （`archive/<sha>.tar.gz`），升級時刻意改 SHA；也可以改用預裝 kjob 的 image。該 commit 必須已推上 GitHub 且
+  不會消失：PR 若以 squash／rebase 合併，合併後要改成 main 上的新 SHA。依賴套件固定為 `kubernetes==32.0.1` wheel。
 * 管理員在主機上直接執行 `ksinfo`、`kqueue -A`（有 cluster 讀取權限的 kubeconfig）會讀即時資料，不經過這個服務。
 
 ## 3. GPU 型號與受限節點

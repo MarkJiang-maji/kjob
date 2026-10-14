@@ -191,21 +191,32 @@ def resolve_gpu_types(values: list[str], node: str | None, snapshot=None) -> tup
     out = []
     snap = snapshot
     for v in values:
-        if v in core.GPU_PRODUCTS:
-            out.append(v)
-            continue
+        alias = v.lower() if v.lower() in core.GPU_PRODUCTS else None
         label_like = v.split("-")[0] in ("NVIDIA", "Tesla", "Quadro")
         if snap is None:
             try:
                 snap = cluster.load_snapshot()
             except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
-                if label_like:
-                    out.append(v)       # a raw product label; nothing to check it against
+                snap = {}
+                if alias or label_like:
+                    out.append(alias or v)  # nothing to check it against
                     continue
                 raise ValueError(f"Unknown GPU type {v!r}: use a short name ({', '.join(core.GPU_PRODUCTS)}), a full "
                                  "nvidia.com/gpu.product value, or -w NODE (the cluster GPU list is not available "
                                  "to check other names).") from None
         nodes = snap.get("nodes", [])
+        if not nodes and (alias or label_like):     # cluster view unavailable (checked above for this value)
+            out.append(alias or v)
+            continue
+        if not nodes:
+            raise ValueError(f"Unknown GPU type {v!r}: use a short name ({', '.join(core.GPU_PRODUCTS)}), a full "
+                             "nvidia.com/gpu.product value, or -w NODE (the cluster GPU list is not available "
+                             "to check other names).")
+        if alias:
+            if not any(n["product"] == core.GPU_PRODUCTS[alias] for n in nodes):
+                raise ValueError(f"GPU type {v!r} ({core.GPU_PRODUCTS[alias]}) is not in this cluster; see ksinfo.")
+            out.append(alias)
+            continue
         types = {}
         for n in nodes:
             types.setdefault(cluster.node_type(n), []).append(n)
@@ -231,6 +242,12 @@ def resolve_gpu_types(values: list[str], node: str | None, snapshot=None) -> tup
             node = types[t][0]["name"]          # unlabeled GPU node: select it by host name
         else:
             raise ValueError(f"{t} has no GPU product label; select it alone with -w {types[t][0]['name']}.")
+    if node and out and snap and snap.get("nodes"):
+        pinned = next((n for n in snap["nodes"] if n["name"] == node), None)
+        wanted = {core.GPU_PRODUCTS.get(g, g) for g in out}
+        if pinned and pinned["product"] not in wanted:
+            raise ValueError(f"Node {node} has {cluster.node_type(pinned)}, not {', '.join(sorted(wanted))}; "
+                             "the job could never start.")
     return out, node
 
 
@@ -251,6 +268,8 @@ def _spec(a) -> core.JobSpec:
     if any("=" not in e for e in a.env):
         raise ValueError("--env must be KEY=VALUE.")
     env = dict(e.split("=", 1) for e in a.env)
+    if a.gpus == 0 and a.gpu_type:
+        raise ValueError("CPU-only jobs (-G 0) cannot select a GPU type (-g).")
     gpu_types, node = resolve_gpu_types([g for g in a.gpu_type.split(",") if g], a.nodelist)
     if a.nodelist and a.gpus:
         _check_node(node, a.gpus)
@@ -296,10 +315,19 @@ def _snapshot_banner(snap: dict) -> str:
     return f"cluster status (published {_dur(age)} ago){stale}"
 
 
+def _job_name(name: str) -> str:
+    """The name kjob gave a job submitted with -J NAME (e.g. 001 -> j-001)."""
+    try:
+        return core.sanitize_name(name)
+    except ValueError:
+        return name
+
+
 def _job_for(name: str) -> core.KJob:
     """KJob handle for an existing job (only the name is needed for monitoring)."""
     j = core.KJob.__new__(core.KJob)
     core._load_config()
+    name = _job_name(name)
     j.spec = core.JobSpec(name=name, script="")
     j.ns = core.current_namespace()
     j.core, j.custom = core.client.CoreV1Api(), core.client.CustomObjectsApi()
@@ -316,11 +344,15 @@ def cmd_submit(a) -> int:
 
 
 def cmd_run(a) -> int:
-    return core.KJob(_spec(a)).run()
+    code = core.KJob(_spec(a)).run()
+    if code == 141:                          # our output pipe was closed (ksrun ... | head): exit quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    return code
 
 
 def cmd_wait(a) -> int:
     j = _job_for(a.name)
+    a.name = j.spec.name
     report = lambda m: print(m, file=sys.stderr, flush=True)
     if j.state() == "Deleted":
         report(f"kjob: no job {a.name} in namespace {j.ns} (already deleted? see kacct / klogs {a.name})")
@@ -331,7 +363,7 @@ def cmd_wait(a) -> int:
         report("kjob: stopped following (job keeps running)")
         return 130
     finally:
-        if not a.keep and j.state() in core.TERMINAL:
+        if not a.keep and (j.state() in core.TERMINAL or getattr(j, "invalid", False)):
             j.delete()
 
 
@@ -391,6 +423,7 @@ def cmd_queue(a) -> int:
 
 def cmd_show(a) -> int:
     j = _job_for(a.name)
+    a.name = j.spec.name
     try:
         o = j.custom.get_namespaced_custom_object(core.GROUP, core.VERSION, j.ns, core.PLURAL, a.name)
     except ApiException as e:
@@ -446,6 +479,7 @@ def cmd_show(a) -> int:
 
 def cmd_logs(a) -> int:
     j = _job_for(a.name)
+    a.name = j.spec.name
     state = j.state()
     report = lambda m: print(m, file=sys.stderr, flush=True)
     try:
@@ -490,6 +524,7 @@ def cmd_cancel(a) -> int:
     ns = core.current_namespace()
     if not (a.names or a.finished or a.all_mine):
         raise ValueError("give job names, --finished or --all-mine")
+    a.names = [_job_name(n) for n in a.names]
     targets = {n: None for n in a.names}
     if a.finished or a.all_mine:
         notebook = None if a.all_notebooks else core.current_notebook()
@@ -514,14 +549,26 @@ def cmd_acct(a) -> int:
         live = {o["metadata"]["name"]: core.job_state(o) for o in core.list_jobs()}
     except (ApiException, HTTPError, ConfigException):
         live = {}              # history still works without cluster access
-    runs, seen, rows = {}, {}, []
+    by_log = {}
+    for r in hist:
+        by_log.setdefault(r.get("log", ""), []).append(r)
+    run_of = {}                 # id(record) -> run: a run belongs to the latest submission made before it started
+    last_run = {}
+    for log, recs in by_log.items():
+        runs = core.log_runs(log)
+        last_run[log] = runs[-1] if runs else None
+        for run in runs:
+            if not run["start"]:
+                continue
+            start = _ts(run["start"]) + dt.timedelta(seconds=60)      # allow some clock skew between nodes
+            before = [x for x in recs if _ts(x["submitted"]) <= start]
+            if before:
+                run_of[id(before[-1])] = run
+    rows = []
     for r in hist:
         log = r.get("log", "")
-        if log not in runs:
-            runs[log] = core.log_runs(log)
-        i = seen[log] = seen.get(log, -1) + 1      # the i-th submission writing to this log is its i-th run
-        run = runs[log][i] if i < len(runs[log]) else None
-        last = i == sum(1 for x in hist if x.get("log") == log) - 1
+        run = run_of.get(id(r))
+        last = r is by_log[log][-1]
         code = run and run["code"]
         if run and run["stopped"]:
             state = "STOPPED"      # time limit or kcancel
@@ -534,7 +581,7 @@ def cmd_acct(a) -> int:
         elapsed = None
         if run and run["start"]:
             end = run["end"]
-            if not end and not (last and r["name"] in live):      # no end line: use the log's last write
+            if not end and run is last_run[log] and not (last and r["name"] in live):   # no end line: last write
                 try:
                     end = dt.datetime.fromtimestamp(os.path.getmtime(log), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 except OSError:
@@ -749,7 +796,7 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:                 # e.g. klogs ... | head
-        sys.stdout = open(os.devnull, "w")
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 0
     except ValueError as e:
         err(str(e))
@@ -757,7 +804,7 @@ def main(argv=None) -> int:
         ap.exit(1, f"kjob: {e}\n")
     except ApiException as e:
         if e.status == 409 and a.cmd in ("submit", "run"):
-            ap.exit(1, f"kjob: a job named {getattr(a, 'job_name', '')} already exists; choose another -J or "
+            ap.exit(1, f"kjob: a job named {_job_name(getattr(a, 'job_name', '') or '')} already exists; choose another -J or "
                        f"kcancel it first\n")
         ap.exit(1, f"kjob: Kubernetes API error ({e.status}): {e.reason}\n")
     except HTTPError as e:  # connection refused/reset, timeouts: the job itself is unaffected

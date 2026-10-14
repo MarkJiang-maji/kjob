@@ -113,9 +113,10 @@ spec:
             - {name: KJOB_SOURCE, value: "https://github.com/MarkJiang-maji/kjob/archive/0e6f72e266e06b6758028419379bcc008972f492.tar.gz"}
           command: [sh, -c]
           args:
-            - pip install --quiet --no-cache-dir --target /tmp/kjob-lib "$KJOB_SOURCE" &&
+            - pip install --quiet --no-cache-dir --target /tmp/kjob-lib --only-binary=:all: "kubernetes==32.0.1" &&
+              pip install --quiet --no-cache-dir --target /tmp/kjob-lib --no-deps "$KJOB_SOURCE" &&
               exec python -m kjob publish-status --interval 30
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
           resources:
             requests: {cpu: 20m, memory: 96Mi}
-            limits: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 256Mi}

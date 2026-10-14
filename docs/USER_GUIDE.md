@@ -78,7 +78,8 @@ ksrun [選項] 腳本 [腳本參數...]     提交、即時輸出、結束後刪
 train.py 的。工作名稱會轉成小寫英數與 `-`，數字開頭時自動加 `j-`。
 
 停止工作（`-t` 時間到、`kcancel`、`ksrun` 按 Ctrl-C）時，程式會收到 SIGTERM，有 30 秒可以存 checkpoint，之後被強制結束。
-Python 可以用 `signal.signal(signal.SIGTERM, handler)` 接住它。
+Python 可以用 `signal.signal(signal.SIGTERM, handler)` 接住它。SIGTERM 會同時送給程式開的子行程（例如 DataLoader
+worker），所以主程式可能先看到 worker 結束的錯誤；存檔的 handler 要寫在主行程，並盡快存。
 
 提交前的檢查（不通過就不會建立工作）：
 
@@ -112,7 +113,11 @@ python3 train.py
 | `--gres=gpu:N`、`--gres=gpu:TYPE:N` | `-G N`（`-g TYPE`） |
 | `--gpus=N`、`--gpus=TYPE:N`、`-G`、`--gpus-per-node` | `-G N`（`-g TYPE`） |
 | `-w`、`--nodelist`、`-x`、`--exclude`、`-D`、`--chdir` | 同名選項 |
+| `--time=UNLIMITED` | 不設時間上限 |
+| `--mem=0`（國網的「整台記憶體」） | 忽略並顯示警告，請明確寫 `--mem` |
 | 其他（`-p`、`-A`、`-o`、`-e`、`-N`、`-n`、`--ntasks`、`--mail-*` ...） | 忽略並顯示警告 |
+
+短選項可以連寫（`-c4`、`-Jname`）。命令列的 `-G 0` 會一併取消腳本裡指定的 GPU 型號。
 
 ## 查看與管理自己的工作
 
@@ -137,7 +142,8 @@ python3 train.py
 | `kinfo` | Notebook 名稱、namespace、image、工作目錄、會帶過去的磁碟、沒帶過去的磁碟與原因、配額使用量 |
 
 `kacct` 的 `STOPPED` 表示被時間上限或 `kcancel` 停止；`ENDED?` 表示工作已不存在、日誌也沒有結束代碼（例如還沒開始就被刪除）。
-同一個名稱重複使用時，每次提交對應日誌裡的那一次執行。
+同一個名稱重複使用時，依時間把日誌裡的每次執行對到它之前最近的那次提交；從未開始的提交顯示 `ENDED?`。
+工作在別的節點寫日誌，Notebook 端的 NFS 快取可能要 30–60 秒才看到最新內容，剛結束的工作可能暫時顯示 `ENDED?`。
 
 ## 查看整個叢集：ksinfo / kqueue -A
 
@@ -179,15 +185,17 @@ GPU_TYPE（排隊中的顯示它要求的型號，沒指定則為 `any`）、NOD
 
 `-g` 可以用：
 
-1. 簡稱：`v100`、`a5000`、`a30`（整張）、`a30-shared`（MPS 共享）。
+1. 簡稱（不分大小寫）：`v100`、`a5000`、`a30`（整張）、`a30-shared`（MPS 共享）。
 2. `ksinfo` GPU_TYPE 欄的名稱，不分大小寫、可省略符號：`Tesla-V100-SXM2-16GB`、`rtx-a5000`。也可以只寫其中一段，
    但必須只對應到一種型號：`v100-sxm2`、`a5000` 可以；`rtx` 同時符合 `NVIDIA-RTX-A5000` 與 `rtxpro6000` 時會報錯，
    請寫清楚或用逗號列出。找不到的名稱直接報錯，不會提交。
 3. 節點名稱（`ksinfo` NODE 欄）：等於 `-w 節點名稱`。沒有型號標籤的 GPU 節點（例如 `rtxpro6000`）以節點名稱當型號名稱。
-4. 原始的 `nvidia.com/gpu.product` 標籤值（例如 `NVIDIA-A30`）。
+4. 原始的 `nvidia.com/gpu.product` 標籤值（例如 `Tesla-V100-SXM2-16GB`）。
 5. 逗號分隔多個型號：`-g v100,a5000` 表示任一種都可以。
 
-第 2、3 種需要叢集狀態服務（`ksinfo` 能用時就可以）。`-w` 指定的節點若不是 GPU 節點也會直接報錯。
+第 2、3 種需要叢集狀態服務（`ksinfo` 能用時就可以）。`ksinfo` 能用時，所有名稱都會先檢查：叢集裡沒有的型號、
+`-w` 指定的不是 GPU 節點、或 `-g` 與 `-w` 互相矛盾（例如 `-g a5000 -w hs5800-1`）都會直接報錯，不會提交一個永遠
+排不到的工作。`-G 0` 不能搭配 `-g`。
 
 不指定 `-g` 時，排程器會挑任何一張空的整張 GPU（自動避開 MPS 共享節點）。
 

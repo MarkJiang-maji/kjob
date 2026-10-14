@@ -123,12 +123,14 @@ def job_shell(name: str, command: str, workdir: str, log: str) -> str:
         "set -o pipefail\n"
         f"mkdir -p {q(str(Path(log).parent))}\n"
         f"cd {q(workdir)} || exit 1\n"
-        'state="${TMPDIR:-/tmp}/kjob-$$"\n'
+        'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
         f"log={q(log)}\n"
         f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel)\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
         f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE"\n'
-        f"  if command -v setsid >/dev/null 2>&1; then setsid {command} & else {command} & fi\n"
+        # background commands start with SIGINT ignored; restore it so KeyboardInterrupt works in the script
+        f"  if command -v setsid >/dev/null 2>&1; then (trap - INT QUIT; exec setsid {command}) &\n"
+        f"  else (trap - INT QUIT; exec {command}) & fi\n"
         '  echo $! > "$state.pid"; wait $!; rc=$?\n'
         f'  echo "[kjob {ts}] exit code $rc"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" &\n'
         "tee_pid=$!\n"
@@ -554,6 +556,7 @@ class KJob:
         phase = self.wait_for_pod(report=report)
         if phase == "Invalid":
             report(f"kjob: {self.spec.name} was rejected by the training operator (see the event above)")
+            self.invalid = True
             return 1
         if phase != "Deleted":
             try:
@@ -586,11 +589,12 @@ class KJob:
         report(f"kjob: submitted {self.spec.name} (log: {self.spec.log_path()})")
         try:
             code = self.follow(out=out, report=report)
-        except KeyboardInterrupt:
-            report(f"kjob: interrupted; cancelling {self.spec.name}")
+        except (KeyboardInterrupt, BrokenPipeError) as e:   # Ctrl-C, or the reader of our output (| head) went away
+            report(f"kjob: {'interrupted' if isinstance(e, KeyboardInterrupt) else 'output closed'}; "
+                   f"cancelling {self.spec.name}")
             if cleanup:
                 self.delete()
-            return 130
+            return 130 if isinstance(e, KeyboardInterrupt) else 141
         if cleanup:
             self.delete()
         return code

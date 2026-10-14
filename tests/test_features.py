@@ -156,8 +156,8 @@ class HistoryTest(unittest.TestCase):
     def test_history_and_log_result(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "j.log"
-            log.write_text("[kjob 2026-01-01T00:00:00Z] start j on node n\nhello\n[kjob 2026-01-01T01:00:05Z] exit code 3\n")
-            self.assertEqual(core.log_result(str(log)), ("2026-01-01T00:00:00Z", "2026-01-01T01:00:05Z", 3))
+            log.write_text("[kjob 2099-01-01T00:00:00Z] start j on node n\nhello\n[kjob 2099-01-01T01:00:05Z] exit code 3\n")
+            self.assertEqual(core.log_result(str(log)), ("2099-01-01T00:00:00Z", "2099-01-01T01:00:05Z", 3))
             job = mock.Mock(ns="ns")
             job.spec = core.JobSpec(name="j", script="x.py", log_dir=d)
             with mock.patch.object(core, "HISTORY_FILE", Path(d) / "h" / "history.jsonl"):
@@ -221,6 +221,9 @@ class NamesAndWrapperTest(unittest.TestCase):
                                  stdout=subprocess.DEVNULL)
             self.assertEqual(p.wait(timeout=10), 3)
             self.assertEqual([r["code"] for r in core.log_runs(str(log))], [7, 3])
+            cmd = f"{sys.executable} -c 'import signal; print(signal.getsignal(signal.SIGINT))'"
+            subprocess.run(["bash", "-c", core.job_shell("j", cmd, d, str(log))], stdout=subprocess.DEVNULL, timeout=10)
+            self.assertIn("default_int_handler", log.read_text())     # not ignored like other background commands
 
     def test_path_command_allowed_but_missing_file_rejected(self):
         from test_regressions import handle
@@ -287,3 +290,39 @@ class AcctTest(unittest.TestCase):
         self.assertIn("STOPPED", lines[1])
         self.assertIn("143", lines[1])
         self.assertIn("PENDING", lines[2])
+
+
+class AcctPairingTest(unittest.TestCase):
+    def test_submission_that_never_started_is_not_paired(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "a.log"
+            log.write_text("[kjob 2026-01-01T01:00:00Z] start a on node n\n[kjob 2026-01-01T01:00:30Z] exit code 3\n")
+            hist = [{"name": "a", "submitted": "2026-01-01T00:00:00Z", "log": str(log), "gpus": 1},   # cancelled while pending
+                    {"name": "a", "submitted": "2026-01-01T00:59:59Z", "log": str(log), "gpus": 1}]
+            out = io.StringIO()
+            with mock.patch.object(core, "read_history", return_value=hist), \
+                    mock.patch.object(core, "list_jobs", return_value=[]), mock.patch("sys.stdout", out):
+                cli.cmd_acct(argparse.Namespace(n=0))
+        first, second = out.getvalue().splitlines()[1:]
+        self.assertIn("ENDED?", first)
+        self.assertIn("FAILED", second)
+        self.assertIn("0m30s", second)
+
+
+class GpuTypeChecksTest(unittest.TestCase):
+    def test_alias_must_exist_and_match_pinned_node(self):
+        snap = cluster.build_snapshot(fake_api())
+        self.assertEqual(cli.resolve_gpu_types(["A5000"], None, snap), (["a5000"], None))
+        with self.assertRaisesRegex(ValueError, "not in this cluster"):
+            cli.resolve_gpu_types(["a30"], None, snap)
+        with self.assertRaisesRegex(ValueError, "could never start"):
+            cli.resolve_gpu_types(["a5000"], "rtxpro6000", snap)
+
+    def test_cpu_job_cannot_pick_gpu_type(self):
+        a = cli.build_parser().parse_args(["submit", "-G", "0", "-g", "rtxpro6000", "x.py"])
+        with self.assertRaisesRegex(ValueError, "CPU-only"):
+            cli._spec(a)
+
+    def test_user_names_are_normalised(self):
+        self.assertEqual(cli._job_name("001"), "j-001")
+        self.assertEqual(cli._job_name("KV_Dup"), "kv-dup")
