@@ -67,8 +67,9 @@ kubectl delete -f deploy/cluster-status.yaml           # 完整移除
 
 每個工作是一個 PyTorchJob（一個 Master replica、`restartPolicy: Never`），標籤
 `app.kubernetes.io/managed-by=kjob`、`kjob/notebook=<Notebook Pod>`，annotation 記錄指令、工作目錄、日誌路徑。
-`runPolicy`：`cleanPodPolicy: None`、`ttlSecondsAfterFinished`（預設 3600）、使用 `-t` 時加上
-`activeDeadlineSeconds`。不設定 `backoffLimit`：舊版 operator 搭配 `backoffLimit: 0` 會在記錄失敗前刪除並重建 Pod，
+`runPolicy`：`cleanPodPolicy: None`、`ttlSecondsAfterFinished`（預設 3600）。`-t` 設在 Pod 的
+`activeDeadlineSeconds`，由 kubelet 從 Pod 開始執行起計時（排隊時間不算）；`runPolicy.activeDeadlineSeconds`
+只在 operator 重新協調時才檢查，實測不會準時停止，所以不使用。不設定 `backoffLimit`：舊版 operator 搭配 `backoffLimit: 0` 會在記錄失敗前刪除並重建 Pod，
 導致腳本跑兩次。工作 Pod 不掛 service account token、不注入 Istio sidecar。
 
 列出／清除所有 kjob 工作：

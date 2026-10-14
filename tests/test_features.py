@@ -107,8 +107,10 @@ class TimeAndDirectiveTest(unittest.TestCase):
             cli._time_arg("soon")
 
     def test_time_limit_in_manifest(self):
-        self.assertEqual(manifest(time_limit=7200)["spec"]["runPolicy"]["activeDeadlineSeconds"], 7200)
-        self.assertNotIn("activeDeadlineSeconds", manifest()["spec"]["runPolicy"])
+        m = manifest(time_limit=7200)
+        self.assertEqual(m["spec"]["pytorchReplicaSpecs"]["Master"]["template"]["spec"]["activeDeadlineSeconds"], 7200)
+        self.assertNotIn("activeDeadlineSeconds", m["spec"]["runPolicy"])     # would also count queueing time
+        self.assertNotIn("activeDeadlineSeconds", manifest()["spec"]["pytorchReplicaSpecs"]["Master"]["template"]["spec"])
 
     def test_directives(self):
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:

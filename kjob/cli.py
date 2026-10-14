@@ -363,13 +363,15 @@ def cmd_show(a) -> int:
     print(f"  resources    gpu={res.get('nvidia.com/gpu', '0')} cpu={res.get('cpu')} mem={res.get('memory')} image={c.get('image')}")
     for e in terms.get("matchExpressions", []):
         print(f"  constraint   {e['key']} {e['operator']} {','.join(e.get('values', []))}")
-    print(f"  time limit   {_dur(rp.get('activeDeadlineSeconds')) if rp.get('activeDeadlineSeconds') else 'none'}"
+    limit = pod_spec.get("activeDeadlineSeconds")
+    print(f"  time limit   {_dur(limit) if limit else 'none'}"
           f"   kept after end {str(rp['ttlSecondsAfterFinished']) + 's' if 'ttlSecondsAfterFinished' in rp else '-'}")
     for cond in (o.get("status") or {}).get("conditions") or []:
         print(f"  condition    {cond['type']}={cond['status']} {cond.get('reason', '')} {cond.get('message', '')[:120]}")
     try:
         pod = j._pod()
-        print(f"  pod          {pod.status.phase} on {pod.spec.node_name or '-'} (started {pod.status.start_time or '-'})")
+        reason = f", {pod.status.reason}" if pod.status.reason else ""     # e.g. DeadlineExceeded at the time limit
+        print(f"  pod          {pod.status.phase}{reason} on {pod.spec.node_name or '-'} (started {pod.status.start_time or '-'})")
         code = j.exit_code()
         if code is not None:
             print(f"  exit code    {code} ({getattr(j, 'exit_reason', '')})")
@@ -539,7 +541,8 @@ def cmd_info(a) -> int:
             f"pvc {v.persistent_volume_claim.claim_name}" if v.persistent_volume_claim else "other"
         print(f"  {m.mount_path:24s} {kind}")
     for n, why in t.skipped.items():
-        print(f"  (not copied: {n} - {why})")
+        if why != "not mounted in the notebook container":     # sidecar volumes: nothing the user mounted
+            print(f"  (not copied: {n} - {why})")
     print("quota (used / hard):")
     for k, used, hard in core.quota():
         print(f"  {k:28s} {used} / {hard}")

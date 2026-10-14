@@ -325,7 +325,10 @@ class KJob:
                 node_selector_terms=[client.V1NodeSelectorTerm(match_expressions=terms)]))) if terms else None
         pod_spec = client.V1PodSpec(containers=[container], volumes=volumes, affinity=affinity,
                                     security_context=t.security_context, image_pull_secrets=t.image_pull_secrets or None,
-                                    automount_service_account_token=False)  # the script does not need API access
+                                    automount_service_account_token=False,  # the script does not need API access
+                                    # Enforced by the kubelet from Pod start, so queueing time does not count
+                                    # (runPolicy.activeDeadlineSeconds is only checked when the operator reconciles).
+                                    active_deadline_seconds=s.time_limit)
         template = client.V1PodTemplateSpec(
             metadata=client.V1ObjectMeta(annotations={"sidecar.istio.io/inject": "false"},
                                          labels={**t.job_labels, "app.kubernetes.io/managed-by": MANAGED_BY}),
@@ -341,8 +344,7 @@ class KJob:
             "spec": {
                 # RestartPolicy Never already makes script failures terminal. A zero backoffLimit
                 # on older operators deletes a failed Pod before recording Failed and can recreate it.
-                "runPolicy": {"cleanPodPolicy": "None", "ttlSecondsAfterFinished": s.ttl_seconds,
-                              **({"activeDeadlineSeconds": s.time_limit} if s.time_limit else {})},
+                "runPolicy": {"cleanPodPolicy": "None", "ttlSecondsAfterFinished": s.ttl_seconds},
                 "pytorchReplicaSpecs": {"Master": {"replicas": 1, "restartPolicy": "Never",
                                                    "template": api.sanitize_for_serialization(template)}},
             },
