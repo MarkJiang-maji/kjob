@@ -190,20 +190,31 @@ class SkillsTest(unittest.TestCase):
             self.assertEqual(inst.read_text(), "edited by the user\n")
             self.assertEqual(cli.install_skills(dest, force=True), [inst])        # kjob install-skills overwrites
 
-    def test_auto_install_into_claude_and_agents_dirs(self):
+    def test_auto_install_agents_dir_with_claude_links(self):
         env = {k: v for k, v in cli.os.environ.items() if k != "KJOB_NO_SKILLS"}
         with tempfile.TemporaryDirectory() as home, mock.patch.object(cli.Path, "home", return_value=Path(home)), \
                 mock.patch("sys.stderr", io.StringIO()) as err:
+            h = Path(home)
             with mock.patch.dict(cli.os.environ, {"KJOB_NO_SKILLS": "1"}):
                 cli.auto_install_skills()
-            self.assertFalse((Path(home) / ".claude").exists())                    # turned off
+            self.assertFalse((h / ".agents").exists())                             # turned off
+            old = h / ".claude" / "skills" / "kjob-jobs"                          # copy made by the previous version
+            old.mkdir(parents=True)
+            (old / "SKILL.md").write_text("old\n")
+            (old / cli.SKILL_MARKER).write_text(cli._sha(old / "SKILL.md") + "\n")
+            mine = h / ".claude" / "skills" / "kjob-install"                      # a copy the user edited
+            mine.mkdir()
+            (mine / "SKILL.md").write_text("my notes\n")
             with mock.patch.dict(cli.os.environ, env, clear=True):
                 cli.auto_install_skills()
                 cli.auto_install_skills()                                         # second run: nothing to do
-            for d in (".claude", ".agents"):                                      # installed even if the tool isn't yet
-                self.assertTrue((Path(home) / d / "skills" / "kjob-jobs" / "SKILL.md").exists())
+            self.assertTrue((h / ".agents" / "skills" / "kjob-jobs" / "SKILL.md").is_file())
+            self.assertTrue(old.is_symlink())
+            self.assertEqual(old.resolve(), (h / ".agents" / "skills" / "kjob-jobs").resolve())
+            self.assertIn("kjob-jobs", (old / "SKILL.md").read_text())           # reads through the link
+            self.assertFalse(mine.is_symlink())
+            self.assertEqual((mine / "SKILL.md").read_text(), "my notes\n")
         self.assertEqual(err.getvalue().count("installed AI skills"), 1)
-        self.assertIn("~/.claude/skills and ~/.agents/skills", err.getvalue())
 
 
 class PublishTest(unittest.TestCase):

@@ -14,7 +14,7 @@ Submitting and following your jobs
 Cluster and environment
   kjob sinfo   [-g TYPE] [-w]             like sinfo: GPUs per type and node (total / used / free / waiting)
   kjob info                               what jobs inherit from this notebook, quota usage
-  kjob install-skills [--dir DIR]         reinstall the AI-assistant skills (automatic: ~/.claude, ~/.agents)
+  kjob install-skills [--dir DIR]         reinstall the AI-assistant skills (automatic: ~/.agents/skills)
 Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, kshow, klogs, kexec, kcancel, kclean, kacct,
 ksinfo, kinfo. Scripts may carry options in '#KJOB' or '#SBATCH' lines at the top; command-line options win.
 """
@@ -709,9 +709,10 @@ def cmd_info(a) -> int:
     return 0
 
 
-# ~/.claude/skills: Claude Code (OpenCode reads it too); ~/.agents/skills: the shared location read by Codex, OpenCode,
-# Gemini CLI, Cursor and other Agent Skills tools. Installed whether or not a tool is present yet.
-SKILL_DIRS = ("~/.claude/skills", "~/.agents/skills")
+# The skills live in ~/.agents/skills, the shared Agent Skills location read by Codex, OpenCode, Gemini CLI, Cursor and
+# others. Claude Code reads only ~/.claude/skills, so that gets a symlink per skill instead of a second copy.
+SKILLS_HOME = "~/.agents/skills"
+CLAUDE_SKILLS = "~/.claude/skills"
 SKILL_MARKER = ".kjob-installed"       # checksum of the SKILL.md kjob wrote; a copy the user edited is left alone
 
 
@@ -745,33 +746,58 @@ def install_skills(dest: Path, force: bool = False) -> list[Path]:
     return written
 
 
-def _skill_dirs() -> list[Path]:
-    return [Path.home() / d[2:] for d in SKILL_DIRS]
+def link_claude_skills(home: Path, claude: Path) -> list[Path]:
+    """Point ~/.claude/skills/<skill> at ~/.agents/skills/<skill>; replace an unedited copy an older kjob made."""
+    linked = []
+    for src in sorted(SKILLS_DIR.glob("*/SKILL.md")):
+        name = src.parent.name
+        target, link = home / name, claude / name
+        if link.is_symlink():
+            if Path(os.readlink(link)) == target:
+                continue
+            link.unlink()
+        elif link.exists():
+            copy = link / "SKILL.md"
+            try:
+                recorded = (link / SKILL_MARKER).read_text().strip()
+            except OSError:
+                recorded = None
+            if _sha(copy) != recorded:
+                continue                       # not ours, or edited by the user: keep it
+            shutil.rmtree(link)
+        claude.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+        linked.append(link)
+    return linked
+
+
+def setup_skills(force: bool = False) -> list[str]:
+    """Install the skills into ~/.agents/skills and link them from ~/.claude/skills; return what changed."""
+    home, claude = Path.home() / SKILLS_HOME[2:], Path.home() / CLAUDE_SKILLS[2:]
+    changed = [str(p) for p in install_skills(home, force=force)]
+    changed += [f"{p} -> {home / p.name}" for p in link_claude_skills(home, claude)]
+    return changed
 
 
 def auto_install_skills() -> None:
     """Keep the kjob skills installed and current for AI assistants (pip has no post-install step)."""
     if os.environ.get("KJOB_NO_SKILLS"):
         return
-    done = []
-    for dest in _skill_dirs():
-        try:
-            if install_skills(dest):
-                done.append(str(dest).replace(str(Path.home()), "~", 1))
-        except OSError:
-            continue
-    if done:
-        print(f"kjob: installed AI skills (kjob-install, kjob-jobs) in {' and '.join(done)}; "
+    try:
+        changed = setup_skills()
+    except OSError:
+        return
+    if changed:
+        print("kjob: installed AI skills (kjob-install, kjob-jobs) in ~/.agents/skills, linked from ~/.claude/skills; "
               "set KJOB_NO_SKILLS=1 to turn this off", file=sys.stderr)
 
 
 def cmd_install_skills(a) -> int:
-    for dest in [Path(a.dir).expanduser()] if a.dir else _skill_dirs():
-        written = install_skills(dest, force=True)
-        for target in written:
-            print(f"installed {target}")
-        if not written:
-            print(f"kjob skills in {dest} are up to date")
+    changed = [str(p) for p in install_skills(Path(a.dir).expanduser(), force=True)] if a.dir else setup_skills(force=True)
+    for c in changed:
+        print(f"installed {c}")
+    if not changed:
+        print("kjob skills are up to date")
     return 0
 
 
@@ -833,9 +859,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_sinfo)
     p = sub.add_parser("info", help="what jobs inherit from this notebook, quota usage")
     p.set_defaults(fn=cmd_info)
-    p = sub.add_parser("install-skills", help="install the kjob skills for AI assistants (done automatically into "
-                       "~/.claude/skills and ~/.agents/skills)")
-    p.add_argument("--dir", default=None, help="another skills directory (default: ~/.claude/skills and ~/.agents/skills)")
+    p = sub.add_parser("install-skills", help="reinstall the kjob skills for AI assistants (done automatically: "
+                       "~/.agents/skills, linked from ~/.claude/skills)")
+    p.add_argument("--dir", default=None, help="copy them into another skills directory instead")
     p.set_defaults(fn=cmd_install_skills)
     p = sub.add_parser("publish-status", help="(administrators) publish the cluster status ConfigMap")
     for sp in sub.choices.values():

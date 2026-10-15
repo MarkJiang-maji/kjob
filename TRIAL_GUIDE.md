@@ -51,38 +51,57 @@ rtxpro6000            1      8     4     4     -             -        restricted
 
 > 若顯示 `cluster-wide view is not available`，代表管理員尚未啟用叢集狀態服務；提交工作不受影響。
 
-## 3. 準備一個 GPU 測試程式
+## 3. 建立測試程式（整段複製貼上）
+
+下面這段會在 `~/kjob-demo` 建立兩個檔案：GPU 測試程式 `gpu_test.py`，以及把資源設定寫在開頭的 `train.sh`。
+整段複製到 Terminal 貼上即可：
 
 ```bash
-mkdir -p ~/kjob-demo && cat > ~/kjob-demo/gpu_test.py <<'PY'
+mkdir -p ~/kjob-demo && cd ~/kjob-demo
+cat > gpu_test.py <<'PY'
 import os, time, torch
-print("node:", os.environ.get("KJOB_NODE"), "| GPU:", torch.cuda.get_device_name(0), flush=True)
+print("job", os.environ.get("KJOB_NAME"), "on node", os.environ.get("KJOB_NODE"), flush=True)
+print("GPUs:", torch.cuda.device_count(), "x", torch.cuda.get_device_name(0), flush=True)
 x = torch.randn(4096, 4096, device="cuda")
 for step in range(5):
-    y = x @ x
-    torch.cuda.synchronize()
+    (x @ x).sum().item()
     print(f"step {step + 1}/5 ok", flush=True)
     time.sleep(1)
 PY
+cat > train.sh <<'SH'
+#!/bin/bash
+#SBATCH --gres=gpu:1
+#SBATCH -c 2
+#SBATCH --mem=8G
+#SBATCH -t 10
+set -e
+cd /home/jovyan/kjob-demo
+python3 -u gpu_test.py
+SH
+ls ~/kjob-demo
 ```
+
+`train.sh` 開頭的 `#SBATCH` 是國網的寫法：1 張 GPU、2 個 CPU、8G 記憶體、最多 10 分鐘。
 
 ## 4. 提交並即時看輸出：`ksrun`
 
 ```bash
-ksrun -G 1 -g v100 -c 2 --mem 8Gi ~/kjob-demo/gpu_test.py
+ksrun ~/kjob-demo/train.sh
 ```
 
 ```text
-kjob: submitted gpu-test-1a2b3c4d5e6f (log: /home/jovyan/kjob-logs/gpu-test-1a2b3c4d5e6f.log)
-kjob: gpu-test-1a2b3c4d5e6f running on hs5800-1
-[kjob 2026-10-15T03:12:05Z] start gpu-test-1a2b3c4d5e6f on node hs5800-1
-node: hs5800-1 | GPU: Tesla V100-SXM2-16GB
+kjob: submitted train-1a2b3c4d5e6f (log: /home/jovyan/kjob-logs/train-1a2b3c4d5e6f.log)
+kjob: train-1a2b3c4d5e6f running on hs5800-3
+[kjob 2026-10-15T09:28:54Z] start train-1a2b3c4d5e6f on node hs5800-3
+job train-1a2b3c4d5e6f on node hs5800-3
+GPUs: 1 x Tesla V100-SXM2-16GB
 step 1/5 ok
 ...
-kjob: gpu-test-1a2b3c4d5e6f Succeeded (exit code 0)
+kjob: train-1a2b3c4d5e6f Succeeded (exit code 0)
 ```
 
-`-g v100` 換成 `ksinfo` 裡你可用的型號（例如 `a5000`、`a30`、`rtxpro6000`），或整個拿掉讓排程器挑任何空的 GPU。
+想指定 GPU 型號就在指令加 `-g`，例如 `ksrun -g v100 ~/kjob-demo/train.sh`；名稱用 `ksinfo` 裡看到的
+（例如 `a5000`、`a30`、`rtxpro6000`）。命令列的選項比檔案開頭的設定優先。
 `ksrun` 結束後會自動刪除工作；按 Ctrl-C 會取消工作。
 
 ## 5. 背景提交：`ksub`
@@ -90,15 +109,15 @@ kjob: gpu-test-1a2b3c4d5e6f Succeeded (exit code 0)
 長時間的訓練用 `ksub`，提交後就可以關掉瀏覽器：
 
 ```bash
-ksub -J demo1 -G 1 -g v100 -c 2 --mem 8Gi -t 30 ~/kjob-demo/gpu_test.py
+ksub -J demo1 ~/kjob-demo/train.sh
 ```
 
 ```text
 Submitted job demo1  (log: /home/jovyan/kjob-logs/demo1.log)
 ```
 
-`-t 30` 是時間上限 30 分鐘，從開始執行算起，時間到工作會被停止（格式也可用 `2:00:00`、`1-12:00:00`、`12h`）。
-停止前程式會先收到 SIGTERM，有 30 秒可以存 checkpoint。
+`-t`（或檔案裡的 `#SBATCH -t`）是時間上限，從開始執行算起，時間到工作會被停止（格式：`30` 分鐘、`2:00:00`、
+`1-12:00:00`、`12h`）。停止前程式會先收到 SIGTERM，有 30 秒可以存 checkpoint。
 
 ## 6. 查看工作
 
@@ -113,18 +132,59 @@ kacct               # 歷史紀錄：是否成功、結束代碼、跑了多久
 
 ```text
 NAME   SUBMITTED(UTC)    GPU  GPU_TYPE/NODE  STATE      EXIT  ELAPSED
-demo1  2026-10-15 03:12  1    v100           COMPLETED  0     0m07s
+demo1  2026-10-15 09:31  1    any            COMPLETED  0     0m07s
 ```
 
 輸出永久保存在 `~/kjob-logs/demo1.log`；程式寫到 `/home/jovyan` 的檔案就在你的 Notebook 裡。
 
 ## 7. 換成自己的程式
 
-建議寫成一個 `.sh`，把資源寫在開頭（`#SBATCH` 是國網語法，也可用 `#KJOB` 寫 kjob 選項）：
+### 多張 GPU 的範例（整段複製貼上）
+
+建立一個用 2 張 GPU 的 PyTorch DDP 訓練範例，並提交：
+
+```bash
+mkdir -p ~/kjob-demo && cd ~/kjob-demo
+cat > ddp_train.py <<'PY'
+import os, torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+dist.init_process_group("nccl")
+rank, world, local = dist.get_rank(), dist.get_world_size(), int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local)
+model = DDP(torch.nn.Linear(1024, 1024).cuda(), device_ids=[local])
+opt = torch.optim.SGD(model.parameters(), lr=0.01)
+for step in range(20):
+    loss = model(torch.randn(256, 1024, device="cuda")).pow(2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    if rank == 0 and step % 5 == 0:
+        print(f"step {step:2d}  loss {loss.item():.4f}  ({world} GPUs)", flush=True)
+if rank == 0:
+    print(f"done on {world} x {torch.cuda.get_device_name(local)}", flush=True)
+dist.destroy_process_group()
+PY
+cat > train_ddp.sh <<'SH'
+#!/bin/bash
+#SBATCH --gres=gpu:2
+#SBATCH -c 4
+#SBATCH --mem=16G
+#SBATCH -t 30
+#KJOB --shm 4Gi
+set -e
+cd /home/jovyan/kjob-demo
+torchrun --standalone --nproc_per_node=2 ddp_train.py
+SH
+ksrun ~/kjob-demo/train_ddp.sh
+```
+
+最後會看到 `done on 2 x ...`。過程中若出現 `[W socket.cpp] ... Address family not supported` 的警告，是 PyTorch 在
+沒有 IPv6 的環境下的提示，可以忽略。
+
+### 套用到自己的程式
+
+複製上面的 `train.sh`，改成自己的路徑、資源和指令即可（`#SBATCH` 是國網語法，也可用 `#KJOB` 寫 kjob 選項）：
 
 ```bash
 #!/bin/bash
-#SBATCH -J resnet50
 #SBATCH --gres=gpu:v100:2
 #SBATCH -c 8
 #SBATCH --mem=64G
@@ -144,7 +204,7 @@ ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
 要點：
 
 * 路徑用絕對路徑，程式、資料、輸出放在 `kinfo` 列出的磁碟上。
-* 多張 GPU 要程式本身支援（DDP / `torchrun`），否則只會用到第一張。
+* 多張 GPU 要程式本身支援（DDP / `torchrun`），否則只會用到第一張；`--nproc_per_node` 要等於 GPU 數。
 * PyTorch DataLoader 的 `num_workers` 大時加大 `--shm`（例如 `--shm 16Gi`）。
 * 只在 Notebook 裝的套件：用 `pip install --user`（裝在 `~/.local`），或在 `/home/jovyan` 建虛擬環境。
 
@@ -169,7 +229,7 @@ kclean             # 刪除這個 Notebook 已結束的工作物件
 
 ## 讓 AI 幫你提交
 
-第 1 步之後第一次執行 kjob 指令時，skill 就自動裝到 `~/.claude/skills` 與 `~/.agents/skills`（畫面會出現一行
+第 1 步之後第一次執行 kjob 指令時，skill 就自動裝到 `~/.agents/skills`，並在 `~/.claude/skills` 放連結（畫面會出現一行
 `kjob: installed AI skills ...`），Claude Code、Codex、OpenCode 等工具都讀得到。
 
 之後在 Notebook 裡使用 Claude Code 等 AI 工具時，可以直接說「用 kjob 幫我把 train.py 交到有空的 V100 上，

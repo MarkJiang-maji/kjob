@@ -53,8 +53,9 @@ ksinfo                    # cluster GPU types and free GPUs (needs the administr
 ## 4. AI skills
 
 The first kjob command (step 3) installs the `kjob-install` and `kjob-jobs` skills automatically into
-`~/.claude/skills` (Claude Code, also read by OpenCode) and `~/.agents/skills` (Codex, OpenCode, Gemini CLI, Cursor
-and other Agent Skills tools), and updates them when kjob is upgraded (copies the user edited are kept).
+`~/.agents/skills` (Codex, OpenCode, Gemini CLI, Cursor and other Agent Skills tools) and links each one from
+`~/.claude/skills` (Claude Code reads only that), and updates them when kjob is upgraded (copies the user edited
+are kept).
 For any other location: `kjob install-skills --dir <its skills dir>`.
 Start a new assistant session if the skills do not show up yet, then use `kjob-jobs` to submit and monitor jobs.
 
