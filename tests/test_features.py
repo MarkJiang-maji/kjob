@@ -326,3 +326,59 @@ class GpuTypeChecksTest(unittest.TestCase):
     def test_user_names_are_normalised(self):
         self.assertEqual(cli._job_name("001"), "j-001")
         self.assertEqual(cli._job_name("KV_Dup"), "kv-dup")
+
+
+class FakeExecStream:
+    """Minimal stand-in for kubernetes.stream.ws_client.WSClient."""
+    def __init__(self, stdout, stderr, code):
+        self._out, self._err, self.returncode, self._open = stdout, stderr, code, True
+
+    def is_open(self):
+        return self._open
+
+    def update(self, timeout=0):
+        self._open = bool(self._out or self._err) and self._open
+
+    def peek_stdout(self):
+        return bool(self._out)
+
+    def read_stdout(self):
+        data, self._out = self._out, ""
+        return data
+
+    def peek_stderr(self):
+        return bool(self._err)
+
+    def read_stderr(self):
+        data, self._err = self._err, ""
+        return data
+
+    def close(self):
+        self._open = False
+
+
+class ExecTest(unittest.TestCase):
+    def job(self, phase="Running"):
+        from test_regressions import handle, pod
+        j = handle()
+        j._pod = mock.Mock(return_value=pod(phase=phase))
+        return j
+
+    def test_runs_command_and_returns_exit_code(self):
+        j = self.job()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("kubernetes.stream.stream", return_value=FakeExecStream("GPU 0: V100\n", "warn\n", 3)) as st:
+            code = j.exec(["nvidia-smi", "-L"], stdin=io.StringIO(), out=out, err=err)
+        self.assertEqual((code, out.getvalue(), err.getvalue()), (3, "GPU 0: V100\n", "warn\n"))
+        kw = st.call_args.kwargs
+        self.assertEqual((kw["command"], kw["container"], kw["tty"], kw["stdin"]), (["nvidia-smi", "-L"], "pytorch", False, False))
+
+    def test_shell_needs_terminal_and_running_pod(self):
+        with self.assertRaisesRegex(ValueError, "needs a terminal"):
+            self.job().exec(None, stdin=io.StringIO())
+        with self.assertRaisesRegex(ValueError, "not running"):
+            self.job("Pending").exec(["true"], stdin=io.StringIO())
+
+    def test_cli_parses_command_after_name(self):
+        a = cli.build_parser().parse_args(["exec", "train", "nvidia-smi", "-L"])
+        self.assertEqual((a.name, a.command), ("train", ["nvidia-smi", "-L"]))

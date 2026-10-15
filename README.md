@@ -46,6 +46,7 @@ kacct                                     # 5. 看歷史紀錄與結束代碼
 | `sinfo` | `ksinfo [-g 型號]` | 每種 GPU、每個節點的總數／使用中／空閒／排隊 |
 | `scontrol show job` | `kshow 工作名稱` | 單一工作的資源、限制、狀態、事件 |
 | — | `klogs 工作名稱 [-f]` | 輸出（工作刪除後改讀日誌檔） |
+| `srun --jobid=ID --pty bash` | `kexec 工作名稱 [指令]` | 在執行中的工作裡跑指令（例如 `nvidia-smi`），不給指令就開一個 shell 進去 |
 | — | `kwait 工作名稱` | 等工作結束並回傳結束代碼 |
 | `sacct` | `kacct` | 自己提交過的工作、結束代碼、執行時間 |
 | `scancel` | `kcancel 工作名稱` | 取消工作 |

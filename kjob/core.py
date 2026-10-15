@@ -529,6 +529,53 @@ class KJob:
         finally:
             resp.close()
 
+    def exec(self, command: list[str] | None = None, stdin=None, out=None, err=None) -> int:
+        """Run a command in the running job container (like srun --jobid=ID --pty bash); return its exit code.
+
+        Without a command, open an interactive login shell (needs a terminal)."""
+        from kubernetes.stream import stream
+        stdin, out, err = stdin or sys.stdin, out or sys.stdout, err or sys.stderr
+        pod = self._pod()
+        if pod.status.phase != "Running":
+            raise ValueError(f"{self.spec.name} is not running (pod {pod.status.phase}); see kshow {self.spec.name}.")
+        tty = not command
+        if tty and not stdin.isatty():
+            raise ValueError("An interactive shell needs a terminal; give a command instead, e.g. kexec NAME nvidia-smi.")
+        resp = stream(self.core.connect_get_namespaced_pod_exec, self.pod_name, self.ns, container="pytorch",
+                      command=command or ["bash", "-l"], stdin=tty, stdout=True, stderr=True, tty=tty,
+                      _preload_content=False)
+        saved = None
+        try:
+            if tty:
+                import termios
+                import tty as tty_mod
+                fd = stdin.fileno()
+                saved = termios.tcgetattr(fd)
+                tty_mod.setraw(fd)
+                size = shutil.get_terminal_size()
+                resp.write_channel(4, json.dumps({"Width": size.columns, "Height": size.lines}))
+            while resp.is_open():
+                resp.update(timeout=0.1)
+                if resp.peek_stdout():
+                    out.write(resp.read_stdout())
+                    out.flush()
+                if resp.peek_stderr():
+                    err.write(resp.read_stderr())
+                    err.flush()
+                if tty:
+                    import select
+                    if select.select([fd], [], [], 0)[0]:
+                        data = os.read(fd, 4096)
+                        if not data:
+                            break
+                        resp.write_stdin(data.decode(errors="replace"))
+        finally:
+            if saved is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            resp.close()
+        code = resp.returncode
+        return code if code is not None else 0
+
     def stop_reason(self) -> str | None:
         """Why the pod ended, when the pod says so (DeadlineExceeded at the -t limit)."""
         try:

@@ -1,6 +1,6 @@
 ---
 name: kjob-jobs
-description: Submit, monitor, debug and cancel GPU training jobs with kjob (ksub, ksrun, kqueue, kshow, klogs, kwait, kcancel, kacct, ksinfo) from a Kubeflow Notebook on the CGU GPU clusters. Use when the user wants to run a script on GPUs "as a job", check GPU availability or the queue, see whose jobs are running, follow job output, or find out why a job is pending or failed.
+description: Submit, monitor, debug and cancel GPU training jobs with kjob (ksub, ksrun, kqueue, kshow, klogs, kexec, kwait, kcancel, kacct, ksinfo) from a Kubeflow Notebook on the CGU GPU clusters. Use when the user wants to run a script on GPUs "as a job", check GPU availability or the queue, see whose jobs are running, follow job output, or find out why a job is pending or failed.
 ---
 
 # Running jobs with kjob
@@ -12,6 +12,8 @@ kjob runs a script as a PyTorchJob that copies the Notebook: same image, same wo
 ## Ground rules for the assistant
 
 * Only touch the user's own jobs. Never cancel, clean or modify other users' workloads; `kqueue -A` is read-only.
+* `kexec NAME` without a command opens an interactive shell and needs a terminal; as an assistant always pass a
+  command (`kexec NAME nvidia-smi`, `kexec NAME ls /home/jovyan/out`). Do not kill or modify the training from inside.
 * Ask before `kcancel --all-mine`, `kcancel --all-notebooks` or anything that deletes several jobs.
 * Request what the script needs, not the maximum: GPUs are shared with the whole lab. Prefer `-G 1` unless the code
   is multi-GPU (DDP/torchrun). Always set a time limit with `-t` for long runs.
@@ -54,6 +56,7 @@ kjob runs a script as a PyTorchJob that copies the Notebook: same image, same wo
    kqueue              # this namespace's jobs: STATE, POD phase, NODE, GPUs, age
    klogs my-train -f   # follow output (Ctrl-C only stops watching)
    kwait my-train      # follow until it ends, then delete the finished job; exit code = script's
+   kexec my-train nvidia-smi   # run a command inside the running job (GPU utilisation, files, processes)
    kshow my-train      # details: resources, constraints, conditions, pod, recent warning events
    kacct               # history of submitted jobs with exit codes and run time
    ```

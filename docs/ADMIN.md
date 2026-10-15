@@ -8,7 +8,7 @@ Python 套件，**不需要**修改 Notebook image、training operator 或節點
 | 項目 | 需求 |
 |---|---|
 | Kubeflow Training Operator | 已安裝 PyTorchJob CRD（`kubectl get crd pytorchjobs.kubeflow.org`）。已在 `kubeflow/training-operator:v1-855e096` 驗證 |
-| Notebook 的 service account | 在自己 namespace 內：讀自己的 Pod、PodDefault、ResourceQuota、Event、Pod log；建立／讀取／刪除 PyTorchJob。Kubeflow profile 預設的 `default-editor` 已具備 |
+| Notebook 的 service account | 在自己 namespace 內：讀自己的 Pod、PodDefault、ResourceQuota、Event、Pod log；建立／讀取／刪除 PyTorchJob；`kexec` 另需 `pods/exec`。Kubeflow profile 預設的 `default-editor` 已具備 |
 | 工作磁碟 | 使用者的 workspace 與資料要在 NFS 或 RWX 儲存上（工作可能跑在別的節點）。底層是 NFS 的 RWO PVC 由 kjob 自動改成 NFS 掛載；一般 RWO 區塊儲存不適用 |
 | GPU 標籤 | GPU 節點最好有 NVIDIA GPU Feature Discovery 的 `nvidia.com/gpu.product` 標籤，使用者才能用 `-g` 選型號 |
 | 網路 | 使用者安裝時需要能連 GitHub 與 PyPI；離線環境請改發 wheel（見第 4 節） |
@@ -17,7 +17,7 @@ Python 套件，**不需要**修改 Notebook image、training operator 或節點
 
 ```bash
 SA=system:serviceaccount:<namespace>:default-editor
-for r in "create pytorchjobs.kubeflow.org" "list poddefaults.kubeflow.org" "list resourcequotas" "get pods/log" "list events"; do
+for r in "create pytorchjobs.kubeflow.org" "list poddefaults.kubeflow.org" "list resourcequotas" "get pods/log" "list events" "create pods/exec"; do
   echo "$r: $(kubectl auth can-i $r -n <namespace> --as=$SA)"
 done
 ```

@@ -130,6 +130,8 @@ python3 train.py
 | `klogs NAME` | 印出輸出；Pod 已不在時改讀日誌檔 |
 | `klogs NAME -f` | 即時跟隨輸出；還在排隊時會先顯示排隊原因並等它開始；Ctrl-C 只停止觀看 |
 | `klogs NAME -o DIR` | 日誌不在預設位置時指定目錄 |
+| `kexec NAME 指令...` | 在執行中的工作容器裡跑一個指令並回傳它的結束代碼，例如 `kexec NAME nvidia-smi` 看 GPU 使用率（≈ 國網 `srun --jobid=ID`） |
+| `kexec NAME` | 開一個互動 shell 進到執行中的工作（≈ `srun --jobid=ID --pty bash`），`exit` 離開，工作不受影響；需要在終端機裡執行 |
 | `kwait NAME` | 等到結束（排隊中會顯示原因），回傳程式的結束代碼，結束後刪除工作物件 |
 | `kwait NAME --keep` | 同上，但不刪除工作物件 |
 | `kacct` | 最近 20 筆提交紀錄：提交時間、GPU、型號/節點、STATE（COMPLETED/FAILED/STOPPED/RUNNING/PENDING/ENDED?）、EXIT、ELAPSED |

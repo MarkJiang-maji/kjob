@@ -7,6 +7,7 @@ Submitting and following your jobs
   kjob queue   [-A] [-w]                  like squeue: your jobs (-A: every GPU workload in the cluster)
   kjob show    NAME                       like scontrol show job: resources, state, node, events, log file
   kjob logs    NAME [-f]                  print (or follow) a job's output; falls back to the saved log file
+  kjob exec    NAME [CMD...]              run a command in a running job, or open a shell (srun --jobid --pty)
   kjob cancel  NAME... | --finished | --all-mine [--all-notebooks]   like scancel
   kjob clean   [--all-notebooks]          delete finished kjob jobs (same as cancel --finished)
   kjob acct    [-n N]                     like sacct: jobs you submitted, with exit code and run time
@@ -14,7 +15,7 @@ Cluster and environment
   kjob sinfo   [-g TYPE] [-w]             like sinfo: GPUs per type and node (total / used / free / waiting)
   kjob info                               what jobs inherit from this notebook, quota usage
   kjob install-skills [--dir DIR]         copy the kjob AI-assistant skills (default ~/.claude/skills)
-Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, kshow, klogs, kcancel, kclean, kacct,
+Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, kshow, klogs, kexec, kcancel, kclean, kacct,
 ksinfo, kinfo. Scripts may carry options in '#KJOB' or '#SBATCH' lines at the top; command-line options win.
 """
 
@@ -477,6 +478,18 @@ def cmd_show(a) -> int:
     return 0
 
 
+def cmd_exec(a) -> int:
+    j = _job_for(a.name)
+    try:
+        j._pod()
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        raise ValueError(f"{j.spec.name} has no running pod (not started yet, or finished); see kshow {j.spec.name}.") from None
+    command = a.command[1:] if a.command[:1] == ["--"] else a.command
+    return j.exec(command)
+
+
 def cmd_logs(a) -> int:
     j = _job_for(a.name)
     a.name = j.spec.name
@@ -735,6 +748,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("show", help="details of one job (scontrol show job)")
     p.add_argument("name")
     p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("exec", help="run a command (or a shell) inside a running job (srun --jobid --pty)")
+    p.add_argument("name")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="command to run; none opens an interactive bash")
+    p.set_defaults(fn=cmd_exec)
     p = sub.add_parser("logs", help="print or follow a job's output")
     p.add_argument("name")
     p.add_argument("-f", "--follow", action="store_true")
@@ -819,6 +836,7 @@ def kwait() -> int: return main(["wait", *sys.argv[1:]])
 def kqueue() -> int: return main(["queue", *sys.argv[1:]])
 def kshow() -> int: return main(["show", *sys.argv[1:]])
 def klogs() -> int: return main(["logs", *sys.argv[1:]])
+def kexec() -> int: return main(["exec", *sys.argv[1:]])
 def kcancel() -> int: return main(["cancel", *sys.argv[1:]])
 def kclean() -> int: return main(["clean", *sys.argv[1:]])
 def kacct() -> int: return main(["acct", *sys.argv[1:]])

@@ -106,6 +106,7 @@ Submitted job demo1  (log: /home/jovyan/kjob-logs/demo1.log)
 kqueue              # 自己的工作：狀態、節點、GPU 數
 klogs demo1 -f      # 即時看輸出（還在排隊會先等），Ctrl-C 只停止觀看，工作繼續跑
 kshow demo1         # 詳細資訊；排隊太久時看這裡的 event 找原因
+kexec demo1 nvidia-smi   # 在執行中的工作裡跑指令，例如看 GPU 使用率；只打 kexec demo1 會開 shell 進去
 kwait demo1         # 等到結束，回傳程式的結束代碼
 kacct               # 歷史紀錄：是否成功、結束代碼、跑了多久
 ```
