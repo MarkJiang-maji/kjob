@@ -33,7 +33,7 @@ klogs test -f                             # 4. 即時看輸出（Ctrl-C 只停�
 kacct                                     # 5. 看歷史紀錄與結束代碼
 ```
 
-完整新手教學請看 [TRIAL_GUIDE.md](TRIAL_GUIDE.md)，簡報版在 [docs/kjob-tutorial.pptx](docs/kjob-tutorial.pptx)。
+完整新手教學請看 [TRIAL_GUIDE.md](TRIAL_GUIDE.md)，簡報版在 [docs/kjob-tutorial.pdf](docs/kjob-tutorial.pdf)。
 
 ## 指令一覽
 
@@ -75,7 +75,7 @@ kjob 的工作是獨立的容器，這幾件事改用 `klogs`、`kclean`、`kinf
 |---|---|
 | [TRIAL_GUIDE.md](TRIAL_GUIDE.md) | 第一次使用：安裝、提交 GPU 範例、查看結果 |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | 全部指令與選項、排隊與錯誤排解、Python API |
-| [docs/kjob-tutorial.pptx](docs/kjob-tutorial.pptx) | 教學簡報 |
+| [docs/kjob-tutorial.pdf](docs/kjob-tutorial.pdf) | 教學簡報（可在 GitHub 直接看；要修改請用同目錄的 `.pptx`） |
 | [docs/ADMIN.md](docs/ADMIN.md) | 叢集管理員：權限需求、叢集狀態服務、GPU 標籤 |
 | [kjob/skills/](kjob/skills/) | AI 助手 skill：安裝 kjob、提交與監看工作 |
 
