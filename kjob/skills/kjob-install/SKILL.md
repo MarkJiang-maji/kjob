@@ -50,14 +50,12 @@ ksinfo                    # cluster GPU types and free GPUs (needs the administr
 * `ksinfo` says "cluster-wide view is not available": the administrator has not deployed the status service.
   Job submission still works; only the cluster overview is missing.
 
-## 4. Install the job-submission skill for the AI assistant (optional)
+## 4. AI skills
 
-```bash
-kjob install-skills                      # copies kjob-install and kjob-jobs into ~/.claude/skills
-kjob install-skills --dir ~/.codex/skills   # another agent's skills directory
-```
-
-After that, use the `kjob-jobs` skill to submit and monitor jobs.
+The first kjob command (step 3) installs the `kjob-install` and `kjob-jobs` skills automatically into
+`~/.claude/skills` and/or `~/.codex/skills` when those directories exist, and updates them when kjob is upgraded
+(copies the user edited are kept). For another agent: `kjob install-skills --dir <its skills dir>`.
+Start a new assistant session if the skills do not show up yet, then use `kjob-jobs` to submit and monitor jobs.
 
 ## Upgrade / uninstall
 

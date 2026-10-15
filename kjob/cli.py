@@ -14,7 +14,7 @@ Submitting and following your jobs
 Cluster and environment
   kjob sinfo   [-g TYPE] [-w]             like sinfo: GPUs per type and node (total / used / free / waiting)
   kjob info                               what jobs inherit from this notebook, quota usage
-  kjob install-skills [--dir DIR]         copy the kjob AI-assistant skills (default ~/.claude/skills)
+  kjob install-skills [--dir DIR]         copy the kjob AI-assistant skills (automatic for ~/.claude, ~/.codex)
 Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, kshow, klogs, kexec, kcancel, kclean, kacct,
 ksinfo, kinfo. Scripts may carry options in '#KJOB' or '#SBATCH' lines at the top; command-line options win.
 """
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import os
 import re
 import shlex
@@ -708,13 +709,63 @@ def cmd_info(a) -> int:
     return 0
 
 
-def cmd_install_skills(a) -> int:
-    dest = Path(a.dir).expanduser()
+AGENT_HOMES = (".claude", ".codex")    # skills go to ~/<agent>/skills when that AI tool is installed
+SKILL_MARKER = ".kjob-installed"       # checksum of the SKILL.md kjob wrote; a copy the user edited is left alone
+
+
+def _sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def install_skills(dest: Path, force: bool = False) -> list[Path]:
+    """Copy the bundled skills into dest and return the files written. Unless forced, keep files the user edited."""
+    written = []
     for src in sorted(SKILLS_DIR.glob("*/SKILL.md")):
         target = dest / src.parent.name / "SKILL.md"
+        marker = target.parent / SKILL_MARKER
+        current = _sha(target)
+        if current == _sha(src):
+            continue
+        if current is not None and not force:
+            try:
+                recorded = marker.read_text().strip()
+            except OSError:
+                recorded = None
+            if current != recorded:
+                continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, target)
+        marker.write_text(_sha(target) + "\n")
+        written.append(target)
+    return written
+
+
+def auto_install_skills() -> None:
+    """Keep the kjob skills installed and current for the AI tools present (pip has no post-install step)."""
+    if os.environ.get("KJOB_NO_SKILLS"):
+        return
+    for agent in AGENT_HOMES:
+        home = Path.home() / agent
+        if not home.is_dir():
+            continue
+        try:
+            written = install_skills(home / "skills")
+        except OSError:
+            continue
+        if written:
+            print(f"kjob: installed AI skills in {home / 'skills'} ({', '.join(p.parent.name for p in written)}); "
+                  "set KJOB_NO_SKILLS=1 to turn this off", file=sys.stderr)
+
+
+def cmd_install_skills(a) -> int:
+    written = install_skills(Path(a.dir).expanduser(), force=True)
+    for target in written:
         print(f"installed {target}")
+    if not written:
+        print(f"kjob skills in {Path(a.dir).expanduser()} are up to date")
     return 0
 
 
@@ -776,7 +827,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_sinfo)
     p = sub.add_parser("info", help="what jobs inherit from this notebook, quota usage")
     p.set_defaults(fn=cmd_info)
-    p = sub.add_parser("install-skills", help="install the kjob skills for AI coding assistants")
+    p = sub.add_parser("install-skills", help="install the kjob skills for AI assistants (done automatically for "
+                       "~/.claude and ~/.codex)")
     p.add_argument("--dir", default="~/.claude/skills", help="skills directory (default ~/.claude/skills)")
     p.set_defaults(fn=cmd_install_skills)
     p = sub.add_parser("publish-status", help="(administrators) publish the cluster status ConfigMap")
@@ -804,6 +856,8 @@ def main(argv=None) -> int:
     if getattr(a, "args", None) and a.args[:1] == ["--"]:
         a.args = a.args[1:]
     try:
+        if a.cmd not in ("install-skills", "publish-status"):
+            auto_install_skills()
         if a.cmd not in ("install-skills", "acct"):
             try:
                 core._load_config()

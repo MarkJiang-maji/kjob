@@ -172,10 +172,38 @@ class HistoryTest(unittest.TestCase):
 
 class SkillsTest(unittest.TestCase):
     def test_install_skills(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout", io.StringIO()):
             cli.cmd_install_skills(argparse.Namespace(dir=d))
             names = sorted(p.parent.name for p in Path(d).glob("*/SKILL.md"))
         self.assertEqual(names, ["kjob-install", "kjob-jobs"])
+
+    def test_updates_kjob_copies_but_keeps_user_edits(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d)
+            self.assertEqual(len(cli.install_skills(dest)), 2)
+            self.assertEqual(cli.install_skills(dest), [])                        # already current
+            jobs, inst = dest / "kjob-jobs" / "SKILL.md", dest / "kjob-install" / "SKILL.md"
+            jobs.write_text("old version\n")                                       # an older kjob wrote this
+            (jobs.parent / cli.SKILL_MARKER).write_text(cli._sha(jobs) + "\n")
+            inst.write_text("edited by the user\n")                               # user's own change
+            self.assertEqual(cli.install_skills(dest), [jobs])
+            self.assertEqual(inst.read_text(), "edited by the user\n")
+            self.assertEqual(cli.install_skills(dest, force=True), [inst])        # kjob install-skills overwrites
+
+    def test_auto_install_only_for_present_tools(self):
+        env = {k: v for k, v in cli.os.environ.items() if k != "KJOB_NO_SKILLS"}
+        with tempfile.TemporaryDirectory() as home, mock.patch.object(cli.Path, "home", return_value=Path(home)), \
+                mock.patch.dict(cli.os.environ, env, clear=True), mock.patch("sys.stderr", io.StringIO()) as err:
+            cli.auto_install_skills()
+            self.assertFalse((Path(home) / ".claude").exists())                    # no AI tool: nothing created
+            (Path(home) / ".claude").mkdir()
+            with mock.patch.dict(cli.os.environ, {"KJOB_NO_SKILLS": "1"}):
+                cli.auto_install_skills()
+            self.assertFalse((Path(home) / ".claude" / "skills").exists())
+            cli.auto_install_skills()
+            self.assertTrue((Path(home) / ".claude" / "skills" / "kjob-jobs" / "SKILL.md").exists())
+            self.assertFalse((Path(home) / ".codex").exists())
+        self.assertIn("installed AI skills", err.getvalue())
 
 
 class PublishTest(unittest.TestCase):
