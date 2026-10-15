@@ -141,7 +141,8 @@ demo1  2026-10-15 09:31  1    any            COMPLETED  0     0m07s
 
 ### 多張 GPU 的範例（整段複製貼上）
 
-建立一個用 2 張 GPU 的 PyTorch DDP 訓練範例，並提交：
+建立一個用 2 張 GPU 的 PyTorch DDP 訓練範例並提交。`train_ddp.sh` 裡已附上常用的選項，`##SBATCH`（兩個 `#`）
+和 `# source ...` 代表先不使用，要用時拿掉一個 `#` 即可（國網也是這個慣例）：
 
 ```bash
 mkdir -p ~/kjob-demo && cd ~/kjob-demo
@@ -164,14 +165,18 @@ dist.destroy_process_group()
 PY
 cat > train_ddp.sh <<'SH'
 #!/bin/bash
-#SBATCH --gres=gpu:2
-#SBATCH -c 4
-#SBATCH --mem=16G
-#SBATCH -t 30
-#KJOB --shm 4Gi
+#SBATCH --gres=gpu:2                # GPU 張數（任何型號）
+##SBATCH --gres=gpu:v100:2          # 指定型號：拿掉一個 #；型號名稱看 ksinfo（例如 a5000、a30）
+##SBATCH -w hs5800-1                # 指定節點：拿掉一個 #；節點名稱看 ksinfo
+#SBATCH -c 4                        # CPU 核心
+#SBATCH --mem=16G                   # 記憶體
+#SBATCH -t 30                       # 時間上限（分鐘），也可寫 2:00:00、1-00:00:00
+#KJOB --shm 4Gi                     # /dev/shm；DataLoader worker 多時加大
 set -e
 cd /home/jovyan/kjob-demo
-torchrun --standalone --nproc_per_node=2 ddp_train.py
+# source /home/jovyan/venv/bin/activate     # 用自己的虛擬環境：拿掉開頭的 #
+NGPU=$(python3 -c "import torch; print(torch.cuda.device_count())")   # 拿到幾張就開幾個程序
+torchrun --standalone --nproc_per_node="$NGPU" ddp_train.py
 SH
 ksrun ~/kjob-demo/train_ddp.sh
 ```
@@ -179,34 +184,8 @@ ksrun ~/kjob-demo/train_ddp.sh
 最後會看到 `done on 2 x ...`。過程中若出現 `[W socket.cpp] ... Address family not supported` 的警告，是 PyTorch 在
 沒有 IPv6 的環境下的提示，可以忽略。
 
-### 套用到自己的程式
-
-複製上面的 `train.sh`，改成自己的路徑、資源和指令即可（`#SBATCH` 是國網語法，也可用 `#KJOB` 寫 kjob 選項）：
-
-```bash
-#!/bin/bash
-#SBATCH --gres=gpu:v100:2
-#SBATCH -c 8
-#SBATCH --mem=64G
-#SBATCH -t 1-00:00:00
-#KJOB --shm 16Gi
-set -e
-cd /home/jovyan/project
-source /home/jovyan/venv/bin/activate          # 若使用自己的虛擬環境
-torchrun --standalone --nproc_per_node=2 train.py --epochs 100
-```
-
-```bash
-ksub train.sh                 # 依照檔案開頭的設定提交
-ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
-```
-
-要點：
-
-* 路徑用絕對路徑，程式、資料、輸出放在 `kinfo` 列出的磁碟上。
-* 多張 GPU 要程式本身支援（DDP / `torchrun`），否則只會用到第一張；`--nproc_per_node` 要等於 GPU 數。
-* PyTorch DataLoader 的 `num_workers` 大時加大 `--shm`（例如 `--shm 16Gi`）。
-* 只在 Notebook 裝的套件：用 `pip install --user`（裝在 `~/.local`），或在 `/home/jovyan` 建虛擬環境。
+要指定 GPU 型號、節點、用虛擬環境，就把上面 `train_ddp.sh` 裡對應那行開頭多的 `#` 拿掉。其他改法（多種型號擇一、
+換張數、跑更久、套用到自己的程式）見 [USER_GUIDE 的「腳本範本與常見改法」](docs/USER_GUIDE.md#腳本範本與常見改法)。
 
 ## 8. 取消與清理
 

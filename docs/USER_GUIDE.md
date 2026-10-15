@@ -6,6 +6,7 @@
 * [安裝與更新](#安裝與更新)
 * [提交工作：ksub / ksrun](#提交工作ksub--ksrun)
 * [腳本內設定：#SBATCH / #KJOB](#腳本內設定sbatch--kjob)
+* [腳本範本與常見改法](#腳本範本與常見改法)
 * [查看與管理自己的工作](#查看與管理自己的工作)
 * [查看整個叢集：ksinfo / kqueue -A](#查看整個叢集ksinfo--kqueue--a)
 * [GPU 型號、受限節點與共享 GPU](#gpu-型號受限節點與共享-gpu)
@@ -118,6 +119,48 @@ python3 train.py
 | 其他（`-p`、`-A`、`-o`、`-e`、`-N`、`-n`、`--ntasks`、`--mail-*` ...） | 忽略並顯示警告 |
 
 短選項可以連寫（`-c4`、`-Jname`）。命令列的 `-G 0` 會一併取消腳本裡指定的 GPU 型號。
+
+## 腳本範本與常見改法
+
+新手範例（1 張與 2 張 GPU）見 [TRIAL_GUIDE.md](../TRIAL_GUIDE.md) 第 3、7 步。自己的訓練程式建議寫成 `.sh`，
+資源寫在開頭（`#SBATCH` 是國網語法，`#KJOB` 寫 kjob 選項；`##SBATCH` 兩個 `#` 表示這行先不生效）：
+
+```bash
+#!/bin/bash
+#SBATCH --gres=gpu:v100:2
+#SBATCH -c 8
+#SBATCH --mem=64G
+#SBATCH -t 1-00:00:00
+#KJOB --shm 16Gi
+set -e
+cd /home/jovyan/project
+source /home/jovyan/venv/bin/activate          # 若使用自己的虛擬環境
+torchrun --standalone --nproc_per_node=2 train.py --epochs 100
+```
+
+```bash
+ksub train.sh                 # 依照檔案開頭的設定提交
+ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
+```
+
+| 想要 | 在 `.sh` 開頭這樣寫（或提交時加在 `ksub` 後面） |
+|---|---|
+| 指定 GPU 型號 | `#SBATCH --gres=gpu:v100:2`（或 `ksub -g v100 ...`） |
+| 幾種型號都可以 | `ksub -g v100,a5000 ...` |
+| 指定節點 | `#SBATCH -w hs5800-1`（或 `ksub -w hs5800-1 ...`） |
+| 換 GPU 張數 | `#SBATCH --gres=gpu:4`；`torchrun --nproc_per_node` 也要跟著改（TRIAL_GUIDE 的範例會自動偵測） |
+| 只用 1 張 | `ksub -G 1 train.sh`（命令列優先於檔案開頭的設定） |
+| 跑更久 | `#SBATCH -t 1-00:00:00`（1 天） |
+| 用自己的虛擬環境 | 腳本裡 `source /home/jovyan/venv/bin/activate`。環境要建在 `/home/jovyan` 底下，例如 `python3 -m venv --system-site-packages /home/jovyan/venv`（沿用 image 的 PyTorch，再 `pip install` 自己要的套件） |
+| 傳環境變數給程式 | `ksub --env WANDB_MODE=offline ...` |
+| 暫時停用某行設定 | 開頭改成 `##SBATCH`（兩個 `#`） |
+
+要點：
+
+* 路徑用絕對路徑，程式、資料、輸出放在 `kinfo` 列出的磁碟上。
+* 多張 GPU 要程式本身支援（DDP / `torchrun`），否則只會用到第一張；`--nproc_per_node` 要等於 GPU 數（可用 `NGPU=$(python3 -c "import torch; print(torch.cuda.device_count())")` 自動取得）。
+* PyTorch DataLoader 的 `num_workers` 大時加大 `--shm`（例如 `--shm 16Gi`）。
+* 只在 Notebook 裝的套件：用 `pip install --user`（裝在 `~/.local`），或在 `/home/jovyan` 建虛擬環境。
 
 ## 查看與管理自己的工作
 
