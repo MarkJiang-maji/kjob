@@ -173,7 +173,7 @@ class HistoryTest(unittest.TestCase):
 class SkillsTest(unittest.TestCase):
     def test_install_skills(self):
         with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout", io.StringIO()):
-            cli.cmd_install_skills(argparse.Namespace(dir=d))
+            cli.cmd_install_skills(argparse.Namespace(dir=d))                     # --dir: only there
             names = sorted(p.parent.name for p in Path(d).glob("*/SKILL.md"))
         self.assertEqual(names, ["kjob-install", "kjob-jobs"])
 
@@ -190,20 +190,20 @@ class SkillsTest(unittest.TestCase):
             self.assertEqual(inst.read_text(), "edited by the user\n")
             self.assertEqual(cli.install_skills(dest, force=True), [inst])        # kjob install-skills overwrites
 
-    def test_auto_install_only_for_present_tools(self):
+    def test_auto_install_into_claude_and_agents_dirs(self):
         env = {k: v for k, v in cli.os.environ.items() if k != "KJOB_NO_SKILLS"}
         with tempfile.TemporaryDirectory() as home, mock.patch.object(cli.Path, "home", return_value=Path(home)), \
-                mock.patch.dict(cli.os.environ, env, clear=True), mock.patch("sys.stderr", io.StringIO()) as err:
-            cli.auto_install_skills()
-            self.assertFalse((Path(home) / ".claude").exists())                    # no AI tool: nothing created
-            (Path(home) / ".claude").mkdir()
+                mock.patch("sys.stderr", io.StringIO()) as err:
             with mock.patch.dict(cli.os.environ, {"KJOB_NO_SKILLS": "1"}):
                 cli.auto_install_skills()
-            self.assertFalse((Path(home) / ".claude" / "skills").exists())
-            cli.auto_install_skills()
-            self.assertTrue((Path(home) / ".claude" / "skills" / "kjob-jobs" / "SKILL.md").exists())
-            self.assertFalse((Path(home) / ".codex").exists())
-        self.assertIn("installed AI skills", err.getvalue())
+            self.assertFalse((Path(home) / ".claude").exists())                    # turned off
+            with mock.patch.dict(cli.os.environ, env, clear=True):
+                cli.auto_install_skills()
+                cli.auto_install_skills()                                         # second run: nothing to do
+            for d in (".claude", ".agents"):                                      # installed even if the tool isn't yet
+                self.assertTrue((Path(home) / d / "skills" / "kjob-jobs" / "SKILL.md").exists())
+        self.assertEqual(err.getvalue().count("installed AI skills"), 1)
+        self.assertIn("~/.claude/skills and ~/.agents/skills", err.getvalue())
 
 
 class PublishTest(unittest.TestCase):

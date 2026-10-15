@@ -14,7 +14,7 @@ Submitting and following your jobs
 Cluster and environment
   kjob sinfo   [-g TYPE] [-w]             like sinfo: GPUs per type and node (total / used / free / waiting)
   kjob info                               what jobs inherit from this notebook, quota usage
-  kjob install-skills [--dir DIR]         copy the kjob AI-assistant skills (automatic for ~/.claude, ~/.codex)
+  kjob install-skills [--dir DIR]         reinstall the AI-assistant skills (automatic: ~/.claude, ~/.agents)
 Short aliases (installed by pip, also in bin/): ksub, ksrun, kwait, kqueue, kshow, klogs, kexec, kcancel, kclean, kacct,
 ksinfo, kinfo. Scripts may carry options in '#KJOB' or '#SBATCH' lines at the top; command-line options win.
 """
@@ -709,7 +709,9 @@ def cmd_info(a) -> int:
     return 0
 
 
-AGENT_HOMES = (".claude", ".codex")    # skills go to ~/<agent>/skills when that AI tool is installed
+# ~/.claude/skills: Claude Code (OpenCode reads it too); ~/.agents/skills: the shared location read by Codex, OpenCode,
+# Gemini CLI, Cursor and other Agent Skills tools. Installed whether or not a tool is present yet.
+SKILL_DIRS = ("~/.claude/skills", "~/.agents/skills")
 SKILL_MARKER = ".kjob-installed"       # checksum of the SKILL.md kjob wrote; a copy the user edited is left alone
 
 
@@ -743,29 +745,33 @@ def install_skills(dest: Path, force: bool = False) -> list[Path]:
     return written
 
 
+def _skill_dirs() -> list[Path]:
+    return [Path.home() / d[2:] for d in SKILL_DIRS]
+
+
 def auto_install_skills() -> None:
-    """Keep the kjob skills installed and current for the AI tools present (pip has no post-install step)."""
+    """Keep the kjob skills installed and current for AI assistants (pip has no post-install step)."""
     if os.environ.get("KJOB_NO_SKILLS"):
         return
-    for agent in AGENT_HOMES:
-        home = Path.home() / agent
-        if not home.is_dir():
-            continue
+    done = []
+    for dest in _skill_dirs():
         try:
-            written = install_skills(home / "skills")
+            if install_skills(dest):
+                done.append(str(dest).replace(str(Path.home()), "~", 1))
         except OSError:
             continue
-        if written:
-            print(f"kjob: installed AI skills in {home / 'skills'} ({', '.join(p.parent.name for p in written)}); "
-                  "set KJOB_NO_SKILLS=1 to turn this off", file=sys.stderr)
+    if done:
+        print(f"kjob: installed AI skills (kjob-install, kjob-jobs) in {' and '.join(done)}; "
+              "set KJOB_NO_SKILLS=1 to turn this off", file=sys.stderr)
 
 
 def cmd_install_skills(a) -> int:
-    written = install_skills(Path(a.dir).expanduser(), force=True)
-    for target in written:
-        print(f"installed {target}")
-    if not written:
-        print(f"kjob skills in {Path(a.dir).expanduser()} are up to date")
+    for dest in [Path(a.dir).expanduser()] if a.dir else _skill_dirs():
+        written = install_skills(dest, force=True)
+        for target in written:
+            print(f"installed {target}")
+        if not written:
+            print(f"kjob skills in {dest} are up to date")
     return 0
 
 
@@ -827,9 +833,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_sinfo)
     p = sub.add_parser("info", help="what jobs inherit from this notebook, quota usage")
     p.set_defaults(fn=cmd_info)
-    p = sub.add_parser("install-skills", help="install the kjob skills for AI assistants (done automatically for "
-                       "~/.claude and ~/.codex)")
-    p.add_argument("--dir", default="~/.claude/skills", help="skills directory (default ~/.claude/skills)")
+    p = sub.add_parser("install-skills", help="install the kjob skills for AI assistants (done automatically into "
+                       "~/.claude/skills and ~/.agents/skills)")
+    p.add_argument("--dir", default=None, help="another skills directory (default: ~/.claude/skills and ~/.agents/skills)")
     p.set_defaults(fn=cmd_install_skills)
     p = sub.add_parser("publish-status", help="(administrators) publish the cluster status ConfigMap")
     for sp in sub.choices.values():

@@ -169,8 +169,8 @@ kclean             # 刪除這個 Notebook 已結束的工作物件
 
 ## 讓 AI 幫你提交
 
-有 Claude Code 或 Codex 的話，第 1 步之後第一次執行 kjob 指令時，skill 就已經自動裝好（畫面會出現一行
-`kjob: installed AI skills ...`）。其他 AI 工具用 `kjob install-skills --dir 目錄`。
+第 1 步之後第一次執行 kjob 指令時，skill 就自動裝到 `~/.claude/skills` 與 `~/.agents/skills`（畫面會出現一行
+`kjob: installed AI skills ...`），Claude Code、Codex、OpenCode 等工具都讀得到。
 
 之後在 Notebook 裡使用 Claude Code 等 AI 工具時，可以直接說「用 kjob 幫我把 train.py 交到有空的 V100 上，
 2 張 GPU、跑 12 小時」，AI 會依照 skill 的規則選型號、設定資源、提交並回報工作名稱。你仍應確認 AI 選的資源合理。

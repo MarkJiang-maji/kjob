@@ -62,9 +62,10 @@ kjob 的工作是獨立的容器，這幾件事改用 `klogs`、`kclean`、`kinf
 
 ## 讓 AI 助手幫你
 
-不用另外安裝：裝好 kjob 後第一次執行任何 kjob 指令（例如上面的 `kinfo`），若這個帳號有 Claude Code（`~/.claude`）
-或 Codex（`~/.codex`），kjob 會自動把 skill 裝進去，升級 kjob 時也會一起更新（你改過的 skill 不會被覆蓋）。
-其他 AI 工具用 `kjob install-skills --dir 目錄`；不想自動安裝就設定 `KJOB_NO_SKILLS=1`。
+不用另外安裝：裝好 kjob 後第一次執行任何 kjob 指令（例如上面的 `kinfo`），kjob 會自動把 skill 裝到
+`~/.claude/skills`（Claude Code）與 `~/.agents/skills`（Codex、OpenCode、Gemini CLI、Cursor 等支援 Agent Skills
+的工具共用的位置），之後才裝 AI 工具也直接能用；升級 kjob 時一起更新（你改過的 skill 不會被覆蓋）。
+其他位置用 `kjob install-skills --dir 目錄`；不想自動安裝就設定 `KJOB_NO_SKILLS=1`。
 
 之後可以直接跟 AI 說「幫我用 kjob 把 train.py 交到有空的 GPU 上跑，記憶體 32G」。還沒安裝 kjob 時，可以請 AI
 閱讀 [kjob/skills/kjob-install/SKILL.md](kjob/skills/kjob-install/SKILL.md) 照步驟安裝。

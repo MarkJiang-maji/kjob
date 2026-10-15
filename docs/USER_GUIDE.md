@@ -242,11 +242,17 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 | [kjob-install](../kjob/skills/kjob-install/SKILL.md) | 在 Notebook 安裝、驗證、更新 kjob，常見安裝問題 |
 | [kjob-jobs](../kjob/skills/kjob-jobs/SKILL.md) | 選 GPU、準備腳本、提交、監看、排錯；規定 AI 只能動使用者自己的工作 |
 
-第一次執行任何 kjob 指令時，若有 `~/.claude`（Claude Code）或 `~/.codex`（Codex），skill 會自動安裝到其中的
-`skills/`；升級 kjob 後也會自動更新，你改過的 skill 檔不會被覆蓋。設定 `KJOB_NO_SKILLS=1` 可關閉。
+第一次執行任何 kjob 指令時，skill 會自動安裝到兩個位置，不論 AI 工具裝了沒：
+
+| 位置 | 誰會讀 |
+|---|---|
+| `~/.claude/skills` | Claude Code（OpenCode 也會讀） |
+| `~/.agents/skills` | Codex、OpenCode、Gemini CLI、Cursor 等支援 Agent Skills 標準的工具 |
+
+升級 kjob 後也會自動更新，你改過的 skill 檔不會被覆蓋。設定 `KJOB_NO_SKILLS=1` 可關閉。
 
 ```bash
-kjob install-skills                       # 手動安裝／強制覆蓋到 ~/.claude/skills
+kjob install-skills                       # 重新安裝／強制覆蓋到上面兩個位置
 kjob install-skills --dir 其他工具的skills目錄
 ```
 
