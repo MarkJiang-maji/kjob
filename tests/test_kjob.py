@@ -92,7 +92,8 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual((ws.nfs.server, ws.nfs.path), PROC_NFS["/home/jovyan"])
 
     def test_shared_paths(self):
-        self.assertEqual(sorted(template().shared_paths()), ["/datasets", "/home/jovyan"])
+        self.assertEqual(sorted(template().shared_paths()), ["/datasets", "/home/jovyan",   # + PodDefault mounts: jobs get them too
+                                                             "/mnt/groups/group-a-7ef7d056", "/mnt/namespaces/demo-user"])
 
 
 class ManifestTest(unittest.TestCase):

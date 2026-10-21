@@ -185,6 +185,7 @@ class NotebookTemplate:
     runtime_class_name: str | None = None
     tolerations: list = field(default_factory=list)      # V1Toleration set on the notebook itself
     poddefaults_known: bool = True                       # False: PodDefaults unreadable, nothing left to the webhook
+    injected_mounts: list = field(default_factory=list)  # V1VolumeMount a PodDefault adds to the job again
 
     @classmethod
     def from_current_pod(cls, shm_size: str = DEFAULT_SHM) -> "NotebookTemplate":
@@ -242,6 +243,10 @@ class NotebookTemplate:
                 t.skipped[v.name] = "not mounted in the notebook container"
             elif v.name in injected:
                 t.skipped[v.name] = "added automatically by a PodDefault"
+                source = v.nfs or v.persistent_volume_claim
+                t.injected_mounts.append(client.V1VolumeMount(        # the job gets it again: still shared storage
+                    name=v.name, mount_path=m.mount_path,
+                    read_only=bool(m.read_only or (source is not None and source.read_only))))
             elif known and v.name.startswith(MANAGED_VOLUME_PREFIXES):
                 t.skipped[v.name] = "outdated group/namespace share mount (restart the notebook to refresh it)"
             elif v.projected is not None or v.name.startswith("kube-api-access"):
@@ -266,7 +271,7 @@ class NotebookTemplate:
     def shared_paths(self) -> list[str]:
         """Mount points shared with jobs (emptyDir volumes are per pod)."""
         names = {v.name for v in self.volumes if v.empty_dir is None}
-        return [m.mount_path for m in self.volume_mounts if m.name in names]
+        return [m.mount_path for m in self.volume_mounts if m.name in names] + [m.mount_path for m in self.injected_mounts]
 
 
 @dataclass
@@ -487,18 +492,19 @@ class KJob:
         elif "/" in self.spec.script or not shutil.which(self.spec.script):
             raise ValueError(f"Script is not a regular file: {script}")
         # else: a command on PATH (e.g. nvidia-smi); the job uses the same image, so it is there too
+        mounts = self.t.volume_mounts + self.t.injected_mounts
         for p in paths:
             resolved = str(Path(p).expanduser().resolve())
-            covering = [m for m in self.t.volume_mounts if resolved == m.mount_path or
+            covering = [m for m in mounts if resolved == m.mount_path or
                         resolved.startswith(m.mount_path.rstrip("/") + "/")]
             closest = max(covering, key=lambda m: len(m.mount_path), default=None)
             if not closest or closest.mount_path not in shared:
                 raise ValueError(f"{resolved} is not on a shared volume; place scripts, working directory and logs on the Notebook workspace.")
         log = str(Path(self.spec.log_dir).expanduser().resolve())
-        covering = max((m for m in self.t.volume_mounts if log == m.mount_path or
+        covering = max((m for m in mounts if log == m.mount_path or
                         log.startswith(m.mount_path.rstrip("/") + "/")), key=lambda m: len(m.mount_path))
-        volume = next(v for v in self.t.volumes if v.name == covering.name)
-        source = volume.nfs or volume.persistent_volume_claim
+        volume = next((v for v in self.t.volumes if v.name == covering.name), None)   # None: added by a PodDefault
+        source = volume and (volume.nfs or volume.persistent_volume_claim)
         if covering.read_only or (source is not None and source.read_only):
             raise ValueError("Log directory is on a read-only volume; choose a writable workspace.")
 

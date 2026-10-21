@@ -367,6 +367,25 @@ class InheritanceTests(unittest.TestCase):
             self.assertFalse(t.poddefaults_known)
 
 
+    def test_poddefault_mounts_count_as_shared(self):
+        """A notebook whose only shared storage is a PodDefault mount (e.g. the namespace share) can submit."""
+        t = load_template()
+        self.assertIn('/mnt/namespaces/demo-user', t.shared_paths())
+        with mock.patch.object(core.client, 'CoreV1Api'), mock.patch.object(core.client, 'CustomObjectsApi'):
+            j = core.KJob(core.JobSpec(name='t', script='bash', workdir='/mnt/namespaces/demo-user',
+                                       log_dir='/mnt/namespaces/demo-user/logs'), t)
+            j._warn_unshared_paths()                                           # no error
+        pd = {'items': [{'spec': {'volumes': [{'name': 'ns-demo-user', 'nfs': {'server': 's', 'path': '/p', 'readOnly': True}}]}}]}
+        p = notebook_pod()
+        p.spec.volumes[4].nfs.read_only = True                                 # ns-demo-user, read-only share
+        t = load_template(p, pd)
+        with mock.patch.object(core.client, 'CoreV1Api'), mock.patch.object(core.client, 'CustomObjectsApi'):
+            j = core.KJob(core.JobSpec(name='t', script='bash', workdir='/home/jovyan',
+                                       log_dir='/mnt/namespaces/demo-user/logs'), t)
+            with self.assertRaisesRegex(ValueError, 'read-only'):
+                j._warn_unshared_paths()
+
+
 class AccountingTests(unittest.TestCase):
     def test_resubmitted_job_does_not_take_the_old_result(self):
         with tempfile.TemporaryDirectory() as d:
