@@ -175,9 +175,9 @@ class HistoryTest(unittest.TestCase):
     def test_history_and_log_result(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "j.log"
-            log.write_text("[kjob 2099-01-01T00:00:00Z] start j on node n\nhello\n[kjob 2099-01-01T01:00:05Z] exit code 3\n")
+            log.write_text("[kjob 2099-01-01T00:00:00Z] start j on node n run 1f\nhello\n[kjob 2099-01-01T01:00:05Z] exit code 3\n")
             self.assertEqual(core.log_result(str(log)), ("2099-01-01T00:00:00Z", "2099-01-01T01:00:05Z", 3))
-            job = mock.Mock(ns="ns")
+            job = mock.Mock(ns="ns", run_id="1f")
             job.spec = core.JobSpec(name="j", script="x.py", log_dir=d)
             with mock.patch.object(core, "HISTORY_FILE", Path(d) / "h" / "history.jsonl"):
                 core.record_history(job)

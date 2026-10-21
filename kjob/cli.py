@@ -438,7 +438,7 @@ def cmd_show(a) -> int:
         if not rec:
             print(f"kjob: no job {a.name} in namespace {j.ns} and no history record", file=sys.stderr)
             return 1
-        start, end, code = core.log_result(rec["log"])
+        start, end, code = core.log_result(rec["log"], rec.get("run_id"))
         print(f"JobName={a.name}  (deleted from the cluster; from ~/.kjob/history.jsonl)")
         for k in ("submitted", "gpus", "gpu_types", "node", "cpus", "memory", "time_limit", "command", "log"):
             print(f"  {k:12s} {rec.get(k)}")
@@ -569,16 +569,23 @@ def cmd_acct(a) -> int:
     by_log = {}
     for r in hist:
         by_log.setdefault(r.get("log", ""), []).append(r)
-    run_of = {}                 # id(record) -> run: a run belongs to the latest submission made before it started
+    run_of = {}                 # id(record) -> run
     last_run = {}
     for log, recs in by_log.items():
         runs = core.log_runs(log)
         last_run[log] = runs[-1] if runs else None
+        by_id = {r["run_id"]: r for r in recs if r.get("run_id")}
+        legacy = [r for r in recs if not r.get("run_id")]     # submitted by a kjob that did not print run ids
         for run in runs:
+            if run["id"]:
+                if run["id"] in by_id:
+                    run_of[id(by_id[run["id"]])] = run
+                continue
             if not run["start"]:
                 continue
+            # older logs: a run belongs to the latest submission made before it started
             start = _ts(run["start"]) + dt.timedelta(seconds=60)      # allow some clock skew between nodes
-            before = [x for x in recs if _ts(x["submitted"]) <= start]
+            before = [x for x in legacy if _ts(x["submitted"]) <= start]
             if before:
                 run_of[id(before[-1])] = run
     rows = []
@@ -704,6 +711,8 @@ def cmd_info(a) -> int:
     for n, why in t.skipped.items():
         if why != "not mounted in the notebook container":     # sidecar volumes: nothing the user mounted
             print(f"  (not copied: {n} - {why})")
+    if not t.poddefaults_known:
+        print("  (PodDefaults are not readable here: jobs keep the notebook's own copies of shared mounts)")
     print("quota (used / hard):")
     for k, used, hard in core.quota():
         print(f"  {k:28s} {used} / {hard}")

@@ -290,5 +290,124 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(cli.cmd_logs(argparse.Namespace(name='job', follow=True, log_dir='/tmp')), 130)
 
 
+def manifest_from(t, **kw):
+    with mock.patch.object(core.client, 'CoreV1Api'), mock.patch.object(core.client, 'CustomObjectsApi'):
+        return core.KJob(core.JobSpec(name='t', script='/home/jovyan/train.py', **kw), t).manifest()
+
+
+class InheritanceTests(unittest.TestCase):
+    """Notebook settings other users may rely on (found in review: only the author's setup was exercised)."""
+
+    def notebook(self):
+        p = notebook_pod()
+        main = p.spec.containers[0]
+        main.env = [client.V1EnvVar(name='NB_PREFIX', value='/notebook/x'),
+                    client.V1EnvVar(name='API_TOKEN', value_from=client.V1EnvVarSource(
+                        secret_key_ref=client.V1SecretKeySelector(name='tok', key='t'))),
+                    client.V1EnvVar(name='SHARED_DIR', value='/nfs'),                  # PodDefault adds it again
+                    client.V1EnvVar(name='CUDA_VISIBLE_DEVICES', value='0')]           # kjob decides this one
+        main.env_from = [client.V1EnvFromSource(config_map_ref=client.V1ConfigMapEnvSource(name='app-cfg')),
+                         client.V1EnvFromSource(secret_ref=client.V1SecretEnvSource(name='pd-secret'))]
+        p.spec.runtime_class_name = 'nvidia'
+        p.spec.tolerations = [
+            client.V1Toleration(key='node.kubernetes.io/not-ready', operator='Exists', effect='NoExecute', toleration_seconds=300),
+            client.V1Toleration(key='dedicated', operator='Equal', value='team-a', effect='NoSchedule'),
+            client.V1Toleration(key='restricted-gpu', operator='Equal', value='advance', effect='NoSchedule')]
+        return p
+
+    DEFAULTS = {'items': PODDEFAULTS['items'] + [{'spec': {
+        'env': [{'name': 'SHARED_DIR', 'value': '/nfs'}], 'envFrom': [{'secretRef': {'name': 'pd-secret'}}],
+        'tolerations': [{'key': 'restricted-gpu', 'operator': 'Equal', 'value': 'advance', 'effect': 'NoSchedule'}]}}]}
+
+    def test_env_envfrom_runtime_class_and_tolerations_are_inherited(self):
+        m = manifest_from(load_template(self.notebook(), self.DEFAULTS), gpus=0)
+        spec = pod_spec(m)
+        c = spec['containers'][0]
+        env = {e['name']: e for e in c['env']}
+        self.assertEqual(env['NB_PREFIX']['value'], '/notebook/x')
+        self.assertEqual(env['API_TOKEN']['valueFrom']['secretKeyRef']['name'], 'tok')
+        self.assertNotIn('SHARED_DIR', env)                                   # left to the PodDefault
+        self.assertEqual([e['name'] for e in c['env']].count('CUDA_VISIBLE_DEVICES'), 1)
+        self.assertEqual(env['CUDA_VISIBLE_DEVICES']['value'], '-1')           # CPU job still hides GPUs
+        self.assertEqual(c['envFrom'], [{'configMapRef': {'name': 'app-cfg'}}])
+        self.assertEqual(spec['runtimeClassName'], 'nvidia')
+        self.assertEqual(spec['tolerations'], [{'key': 'dedicated', 'operator': 'Equal', 'value': 'team-a',
+                                                'effect': 'NoSchedule'}])
+
+    def test_user_env_overrides_inherited_env(self):
+        c = pod_spec(manifest_from(load_template(self.notebook(), self.DEFAULTS), env={'NB_PREFIX': 'mine'}))['containers'][0]
+        self.assertEqual([e['value'] for e in c['env'] if e['name'] == 'NB_PREFIX'], ['mine'])
+
+    def test_main_container_is_not_guessed_from_order(self):
+        p = notebook_pod()
+        helper = client.V1Container(name='helper', image='helper:1')
+        p.spec.containers.insert(0, helper)
+        with self.assertRaisesRegex(ValueError, 'container'):
+            load_template(p)                                                   # two candidates, nothing says which
+        p.metadata.annotations = {'kubectl.kubernetes.io/default-container': 'training'}
+        self.assertEqual(load_template(p).image, notebook_pod().spec.containers[0].image)
+        p.metadata.annotations = None
+        p.metadata.labels = {'notebook-name': 'training'}
+        self.assertEqual(load_template(p).image, notebook_pod().spec.containers[0].image)
+
+    def test_unreadable_poddefaults_keep_shared_mounts(self):
+        for status in (403, 404):
+            c, o = mock.Mock(), mock.Mock()
+            c.read_namespaced_pod.return_value = notebook_pod()
+            o.list_namespaced_custom_object.side_effect = core.ApiException(status=status)
+            with mock.patch.object(core, '_load_config'), mock.patch.object(core, 'current_namespace', return_value='mtest'), \
+                 mock.patch.object(core, 'current_notebook', return_value='notebook-0'), \
+                 mock.patch.object(core, '_nfs_mounts', return_value=PROC_NFS), \
+                 mock.patch.object(core.os, 'getuid', return_value=0), \
+                 mock.patch.object(core.client, 'CoreV1Api', return_value=c), \
+                 mock.patch.object(core.client, 'CustomObjectsApi', return_value=o):
+                t = core.NotebookTemplate.from_current_pod()
+            names = {v.name for v in t.volumes}
+            self.assertTrue({'gs-group-a', 'gs-group-a-7ef7d056', 'ns-demo-user'} <= names, status)
+            self.assertFalse(t.poddefaults_known)
+
+
+class AccountingTests(unittest.TestCase):
+    def test_resubmitted_job_does_not_take_the_old_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'j.log'
+            hist = Path(d) / 'history.jsonl'
+            old = {'name': 'j', 'submitted': '2099-01-01T00:00:00Z', 'log': str(log), 'gpus': 1, 'run_id': 'aaa'}
+            new = {**old, 'submitted': '2099-01-01T00:00:25Z', 'run_id': 'bbb'}       # resubmitted 20 s after start
+            hist.write_text(core.json.dumps(old) + '\n' + core.json.dumps(new) + '\n')
+            log.write_text('[kjob 2099-01-01T00:00:05Z] start j on node n run aaa\n'
+                           '[kjob 2099-01-01T00:00:06Z] exit code 0\n')
+            out = io.StringIO()
+            with mock.patch.object(core, 'HISTORY_FILE', hist), \
+                 mock.patch.object(core, 'list_jobs', return_value=[{'metadata': {'name': 'j'}}]), \
+                 mock.patch.object(core, 'job_state', return_value='Created'), mock.patch('sys.stdout', out):
+                cli.cmd_acct(argparse.Namespace(n=20))
+            rows = [l.split() for l in out.getvalue().splitlines()[1:]]
+            self.assertEqual([r[5] for r in rows], ['COMPLETED', 'PENDING'])
+            self.assertEqual(core.log_result(str(log), 'bbb'), (None, None, None))     # kshow of the new one
+            self.assertEqual(core.log_result(str(log), 'aaa')[2], 0)
+
+    def test_records_from_older_kjob_still_match_by_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            log, hist = Path(d) / 'j.log', Path(d) / 'history.jsonl'
+            hist.write_text(core.json.dumps({'name': 'j', 'submitted': '2099-01-01T00:00:00Z', 'log': str(log), 'gpus': 1}) + '\n')
+            log.write_text('[kjob 2099-01-01T00:00:05Z] start j on node n\n[kjob 2099-01-01T00:00:06Z] exit code 2\n')
+            out = io.StringIO()
+            with mock.patch.object(core, 'HISTORY_FILE', hist), mock.patch.object(core, 'list_jobs', return_value=[]), \
+                 mock.patch('sys.stdout', out):
+                cli.cmd_acct(argparse.Namespace(n=20))
+            self.assertIn('FAILED', out.getvalue())
+
+    def test_job_prints_and_records_its_run_id(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(core.client, 'CoreV1Api'), \
+                mock.patch.object(core.client, 'CustomObjectsApi'):
+            j = core.KJob(core.JobSpec(name='j', script='/home/jovyan/train.py', log_dir=d), template())
+            shell = pod_spec(j.manifest())['containers'][0]['command'][2]
+            self.assertIn(f'run {j.run_id}', shell)
+            with mock.patch.object(core, 'HISTORY_FILE', Path(d) / 'h.jsonl'):
+                core.record_history(j)
+                self.assertEqual(core.read_history()[0]['run_id'], j.run_id)
+
+
 if __name__ == '__main__':
     unittest.main()

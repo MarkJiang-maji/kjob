@@ -32,6 +32,8 @@ from . import cluster
 GROUP, VERSION, PLURAL = "kubeflow.org", "v1", "pytorchjobs"
 MANAGED_BY = "kjob"
 SIDECAR_CONTAINERS = {"istio-proxy"}
+# Notebook env that must not reach a job: kjob sets these itself (GPU visibility depends on the job's own GPUs).
+KJOB_ENV = {"PYTHONUNBUFFERED", "KJOB_NAME", "KJOB_NODE", "NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"}
 GPU_PRODUCTS = {  # short names for --gpu-type; any other value is used as the raw nvidia.com/gpu.product label
     "a5000": "NVIDIA-RTX-A5000",
     "v100": "Tesla-V100-SXM2-16GB",
@@ -114,7 +116,31 @@ def _nfs_mounts() -> dict[str, tuple[str, str]]:
     return out
 
 
-def job_shell(name: str, command: str, workdir: str, log: str) -> str:
+def main_container(pod: client.V1Pod) -> client.V1Container:
+    """The notebook's own container: named by the default-container annotation or the notebook-name label, or the
+    only non-sidecar container. Container order is not used, so an extra helper container is never picked."""
+    candidates = [c for c in pod.spec.containers if c.name not in SIDECAR_CONTAINERS]
+    for want in ((pod.metadata.annotations or {}).get("kubectl.kubernetes.io/default-container"),
+                 (pod.metadata.labels or {}).get("notebook-name")):
+        hit = [c for c in candidates if want and c.name == want]
+        if hit:
+            return hit[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise ValueError(f"Cannot tell which container of {pod.metadata.name} is the notebook "
+                     f"({', '.join(c.name for c in candidates)}); set the kubectl.kubernetes.io/default-container annotation.")
+
+
+def _env_from_key(e: dict) -> tuple:
+    ref = "configMapRef" if e.get("configMapRef") else "secretRef"
+    return e.get("prefix"), ref, (e.get(ref) or {}).get("name")
+
+
+def _toleration_key(t: dict) -> tuple:
+    return t.get("key"), t.get("operator") or "Equal", t.get("value"), t.get("effect")
+
+
+def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "") -> str:
     """Container command. Output goes to the pod log and to the log file. The script runs in its own process group
     and gets the SIGTERM sent at the -t limit or by kcancel, so it can save state within the grace period
     (bash as PID 1 would otherwise ignore SIGTERM and everything is killed 30 s later)."""
@@ -127,7 +153,7 @@ def job_shell(name: str, command: str, workdir: str, log: str) -> str:
         f"log={q(log)}\n"
         f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel)\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
-        f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE"\n'
+        f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE{" run " + run_id if run_id else ""}"\n'
         # background commands start with SIGINT ignored; restore it so KeyboardInterrupt works in the script
         f"  if command -v setsid >/dev/null 2>&1; then (trap - INT QUIT; exec setsid {command}) &\n"
         f"  else (trap - INT QUIT; exec {command}) & fi\n"
@@ -154,6 +180,11 @@ class NotebookTemplate:
     job_labels: dict = field(default_factory=dict)
     image_pull_secrets: list = field(default_factory=list)
     skipped: dict = field(default_factory=dict)          # volume name -> reason
+    env: list = field(default_factory=list)              # V1EnvVar of the notebook container, minus PodDefault ones
+    env_from: list = field(default_factory=list)         # V1EnvFromSource, minus PodDefault ones
+    runtime_class_name: str | None = None
+    tolerations: list = field(default_factory=list)      # V1Toleration set on the notebook itself
+    poddefaults_known: bool = True                       # False: PodDefaults unreadable, nothing left to the webhook
 
     @classmethod
     def from_current_pod(cls, shm_size: str = DEFAULT_SHM) -> "NotebookTemplate":
@@ -161,21 +192,27 @@ class NotebookTemplate:
         ns = current_namespace()
         core = client.CoreV1Api()
         pod = core.read_namespaced_pod(current_notebook(), ns)
-        main = [c for c in pod.spec.containers if c.name not in SIDECAR_CONTAINERS][0]
-        injected = set()
+        main = main_container(pod)
+        injected, injected_env, injected_env_from, injected_tol = set(), set(), set(), set()
         job_labels = {}
         labels = pod.metadata.labels or {}
+        known = True
         try:
             for pd in client.CustomObjectsApi().list_namespaced_custom_object("kubeflow.org", "v1alpha1", ns, "poddefaults")["items"]:
                 selector = pd["spec"].get("selector", {})
                 if not _matches(selector, labels):
                     continue
                 injected |= {v["name"] for v in pd["spec"].get("volumes", [])}
+                injected_env |= {e["name"] for e in pd["spec"].get("env", [])}
+                injected_env_from |= {_env_from_key(e) for e in pd["spec"].get("envFrom", [])}
+                injected_tol |= {_toleration_key(t) for t in pd["spec"].get("tolerations", [])}
                 keys = set(selector.get("matchLabels", {})) | {e["key"] for e in selector.get("matchExpressions", [])}
                 job_labels.update({k: labels[k] for k in keys if k in labels})
         except ApiException as e:
             if e.status not in (403, 404):
                 raise
+            known = False   # the webhook will not add anything to the job either, so keep the notebook's copies
+        api = client.ApiClient()
         mounts = {m.name: m for m in main.volume_mounts or []}
         nfs = _nfs_mounts()
         identity = {k: getattr(main.security_context, k, None)
@@ -187,7 +224,16 @@ class NotebookTemplate:
                 effective_uid=identity.get("run_as_user", getattr(pod.spec.security_context, "run_as_user", None)
                                            if pod.spec.security_context else None),
                 job_labels=job_labels,
-                image_pull_secrets=pod.spec.image_pull_secrets or [])
+                image_pull_secrets=pod.spec.image_pull_secrets or [],
+                env=[e for e in main.env or [] if e.name not in injected_env | KJOB_ENV
+                     and not e.name.startswith("CUDA_MPS_")],
+                env_from=[e for e in main.env_from or []
+                          if _env_from_key(api.sanitize_for_serialization(e)) not in injected_env_from],
+                runtime_class_name=pod.spec.runtime_class_name,
+                tolerations=[x for x in pod.spec.tolerations or []      # node.kubernetes.io/*: added by Kubernetes
+                             if not (x.key or "").startswith("node.kubernetes.io/")
+                             and _toleration_key(api.sanitize_for_serialization(x)) not in injected_tol],
+                poddefaults_known=known)
         if t.effective_uid is None:
             t.effective_uid = os.getuid()
         for v in pod.spec.volumes or []:
@@ -196,7 +242,7 @@ class NotebookTemplate:
                 t.skipped[v.name] = "not mounted in the notebook container"
             elif v.name in injected:
                 t.skipped[v.name] = "added automatically by a PodDefault"
-            elif v.name.startswith(MANAGED_VOLUME_PREFIXES):
+            elif known and v.name.startswith(MANAGED_VOLUME_PREFIXES):
                 t.skipped[v.name] = "outdated group/namespace share mount (restart the notebook to refresh it)"
             elif v.projected is not None or v.name.startswith("kube-api-access"):
                 t.skipped[v.name] = "service-account token"
@@ -306,6 +352,7 @@ class KJob:
         self.core = client.CoreV1Api()
         self.custom = client.CustomObjectsApi()
         self.pod_name = f"{self.spec.name}-master-0"
+        self.run_id = uuid.uuid4().hex[:12]   # printed in the log's start line; ties a run to this submission
 
     # ---------- manifest ----------
     def manifest(self) -> dict:
@@ -313,11 +360,12 @@ class KJob:
         s.validate()
         workdir = s.workdir or t.working_dir
         log = s.log_path()
-        shell = job_shell(s.name, s.command(), workdir, log)
+        shell = job_shell(s.name, s.command(), workdir, log, self.run_id)
         res = {"cpu": str(s.cpus), "memory": s.memory}
         if s.gpus:
             res["nvidia.com/gpu"] = str(s.gpus)  # CPU-only jobs must not request GPUs at all
-        env = [client.V1EnvVar(name="PYTHONUNBUFFERED", value="1"),
+        env = [e for e in t.env if e.name not in s.env]          # the notebook's own env; --env wins
+        env += [client.V1EnvVar(name="PYTHONUNBUFFERED", value="1"),
                client.V1EnvVar(name="KJOB_NAME", value=s.name),
                client.V1EnvVar(name="KJOB_NODE", value_from=client.V1EnvVarSource(
                    field_ref=client.V1ObjectFieldSelector(field_path="spec.nodeName")))]
@@ -336,6 +384,7 @@ class KJob:
             volume_mounts = [m for m in t.volume_mounts if m.name not in shm]
         container = client.V1Container(
             name="pytorch", image=t.image, command=["bash", "-lc", shell], working_dir=workdir, env=env,
+            env_from=t.env_from or None,
             security_context=t.container_security_context,
             resources=client.V1ResourceRequirements(requests=res, limits=res), volume_mounts=volume_mounts)
         terms = []
@@ -354,6 +403,7 @@ class KJob:
                 node_selector_terms=[client.V1NodeSelectorTerm(match_expressions=terms)]))) if terms else None
         pod_spec = client.V1PodSpec(containers=[container], volumes=volumes, affinity=affinity,
                                     security_context=t.security_context, image_pull_secrets=t.image_pull_secrets or None,
+                                    runtime_class_name=t.runtime_class_name, tolerations=t.tolerations or None,
                                     automount_service_account_token=False,  # the script does not need API access
                                     # Enforced by the kubelet from Pod start, so queueing time does not count
                                     # (runPolicy.activeDeadlineSeconds is only checked when the operator reconciles).
@@ -655,7 +705,7 @@ def record_history(job: "KJob") -> None:
     s = job.spec
     rec = {"name": s.name, "namespace": job.ns, "submitted": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "gpus": s.gpus, "gpu_types": s.gpu_types, "node": s.node, "cpus": s.cpus, "memory": s.memory,
-           "time_limit": s.time_limit, "command": s.command()[:500], "log": s.log_path()}
+           "time_limit": s.time_limit, "command": s.command()[:500], "log": s.log_path(), "run_id": job.run_id}
     try:
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with HISTORY_FILE.open("a") as f:
@@ -679,17 +729,18 @@ def read_history() -> list[dict]:
 
 
 def log_runs(path: str) -> list[dict]:
-    """Runs recorded in a job log by the wrapper's [kjob ...] lines: start, end, exit code, stopped (SIGTERM)."""
+    """Runs recorded in a job log by the wrapper's [kjob ...] lines: start, end, exit code, stopped (SIGTERM), and the
+    submission's run id (None in logs written before kjob printed it)."""
     runs = []
     try:
         with open(path, errors="replace") as f:
             for line in f:
-                m = re.match(r"\[kjob (\S+)\] (start|exit code (\d+)|stopping)", line)
+                m = re.match(r"\[kjob (\S+)\] (start|exit code (\d+)|stopping)(?:.* run ([0-9a-f]+)\s*$)?", line)
                 if not m:
                     continue
                 if m.group(2) == "start" or not runs:
                     runs.append({"start": m.group(1) if m.group(2) == "start" else None, "end": None, "code": None,
-                                 "stopped": False})
+                                 "stopped": False, "id": m.group(4) if m.group(2) == "start" else None})
                 if m.group(2) == "stopping":
                     runs[-1]["stopped"], runs[-1]["end"] = True, m.group(1)
                 elif m.group(3):
@@ -699,9 +750,9 @@ def log_runs(path: str) -> list[dict]:
     return runs
 
 
-def log_result(path: str) -> tuple[str | None, str | None, int | None]:
-    """(start, end, exit code) of the last run in a job log."""
-    runs = log_runs(path)
+def log_result(path: str, run_id: str | None = None) -> tuple[str | None, str | None, int | None]:
+    """(start, end, exit code) of the last run in a job log, or of the run printed with run_id."""
+    runs = [r for r in log_runs(path) if not run_id or r["id"] == run_id]
     return (runs[-1]["start"], runs[-1]["end"], runs[-1]["code"]) if runs else (None, None, None)
 
 

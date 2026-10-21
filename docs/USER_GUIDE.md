@@ -20,11 +20,16 @@
 
 `ksub` 讀取你目前 Notebook Pod 的設定，建立一個 Kubeflow PyTorchJob：
 
-* **image、工作目錄、使用者／群組設定**與 Notebook 相同。
+* **image、工作目錄、使用者／群組設定**與 Notebook 相同。主容器依 `kubectl.kubernetes.io/default-container`
+  annotation、`notebook-name` label 判斷，不看容器順序；判斷不出來時直接報錯。
+* Notebook 主容器的**環境變數**（`env`、`envFrom`）、`runtimeClassName`、Notebook 本身設定的 **toleration** 也會帶過去。
+  例外：PodDefault 會再加一次的項目、Kubernetes 自動加的 `node.kubernetes.io/*` toleration，以及 kjob 自己決定的
+  `CUDA_VISIBLE_DEVICES`、`NVIDIA_VISIBLE_DEVICES` 等變數。`--env` 指定的值優先。
 * **磁碟**：Notebook 主容器掛載的磁碟都會帶過去（`/home/jovyan`、群組資料夾、共用 NFS）。底層是 NFS 的
   ReadWriteOnce 工作磁碟會改用 NFS 直接掛載，所以工作可以跑在別的節點。
   * 不會複製：service account token、Istio sidecar、namespace PodDefault 會自動加上的磁碟（PodDefault 會再加一次）、
-    舊的群組資料夾（`gs-*`、`ns-*`，由 PodDefault 加上目前的版本）。
+    舊的群組資料夾（`gs-*`、`ns-*`，由 PodDefault 加上目前的版本）。讀不到 PodDefault 時（沒有權限或沒有安裝），
+    這些磁碟照 Notebook 原樣帶過去，`kinfo` 會註明。
   * `emptyDir`（例如 `/dev/shm`）在工作裡是新的空目錄；Notebook 的 `/tmp` 工作看不到。
   * `kinfo` 會列出實際會帶過去的內容。
 * namespace 的 **PodDefault**（例如共用 NFS、受限 GPU 節點的 toleration）也會套用到工作。
@@ -187,6 +192,7 @@ ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
 | `kinfo` | Notebook 名稱、namespace、image、工作目錄、會帶過去的磁碟、沒帶過去的磁碟與原因、配額使用量 |
 
 `kacct` 的 `STOPPED` 表示被時間上限或 `kcancel` 停止；`ENDED?` 表示工作已不存在、日誌也沒有結束代碼（例如還沒開始就被刪除）。
+每次提交有自己的 run id，寫在日誌的 start 行，所以同名工作重交時，舊工作的結果不會算到新工作上。
 同一個名稱重複使用時，依時間把日誌裡的每次執行對到它之前最近的那次提交；從未開始的提交顯示 `ENDED?`。
 工作在別的節點寫日誌，Notebook 端的 NFS 快取可能要 30–60 秒才看到最新內容，剛結束的工作可能暫時顯示 `ENDED?`。
 
