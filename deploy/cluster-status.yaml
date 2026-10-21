@@ -110,7 +110,7 @@ spec:
           env:
             - {name: HOME, value: /tmp}
             - {name: PYTHONPATH, value: /tmp/kjob-lib}
-            - {name: KJOB_SOURCE, value: "https://github.com/MarkJiang-maji/kjob/archive/REPLACE_WITH_REVIEWED_COMMIT_SHA.tar.gz"}
+            - {name: KJOB_SOURCE, value: "https://github.com/MarkJiang-maji/kjob/archive/d567fcfdddce943a060f97a522edf4515776a56a.tar.gz"}
           command: [sh, -c]
           args:
             - >-
