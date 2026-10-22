@@ -81,6 +81,7 @@ kacct                     # 自己提交過的工作、結束代碼、執行時�
 ## AI 助手
 
 第一次執行 kjob 指令時會自動安裝 AI skill（Claude Code、Codex 等），之後直接說「用 kjob 把 train.py 交到有空的 GPU 上跑」即可。
+AI 工具擋下指令時 kjob 並沒有執行，要允許哪些指令見 [USER_GUIDE](docs/USER_GUIDE.md#用-ai-執行時常見的問題)。
 
 ## 文件與限制
 

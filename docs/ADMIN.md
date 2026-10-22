@@ -13,14 +13,38 @@ Python 套件，**不需要**修改 Notebook image、training operator 或節點
 | GPU 標籤 | GPU 節點最好有 NVIDIA GPU Feature Discovery 的 `nvidia.com/gpu.product` 標籤，使用者才能用 `-g` 選型號 |
 | 網路 | 使用者安裝時需要能連 GitHub 與 PyPI；離線環境請改發 wheel（見第 4 節） |
 
-檢查某個 namespace 的權限：
+kjob 以 Notebook Pod 的 service account 呼叫 API（不用使用者本人的登入帳號，也不需要 root）。從 Kubeflow 介面建立的
+Notebook 都用 `default-editor`；用 `default` 的 Notebook 沒有任何權限，kjob 會在第一個指令就出現 403。
+
+各指令需要的權限（都在自己的 namespace 內，kjob 不用 watch）：
+
+| 指令 | 需要 |
+|---|---|
+| 全部 | `get pods`（讀自己的 Notebook Pod） |
+| `kinfo` | `list poddefaults.kubeflow.org`、`list resourcequotas` |
+| `ksub`、`ksrun` | 上一列，加上 `create pytorchjobs.kubeflow.org`；`ksrun` 另需下面 `kwait` 的權限 |
+| `kqueue`、`kacct` | `list pytorchjobs.kubeflow.org`、`list pods` |
+| `kshow` | `get pytorchjobs.kubeflow.org`、`list events` |
+| `klogs` | `get pods/log`、`get pytorchjobs.kubeflow.org` |
+| `kwait` | `get pytorchjobs.kubeflow.org`、`get pods/log`、`delete pytorchjobs.kubeflow.org` |
+| `kexec` | `create pods/exec` |
+| `kcancel`、`kclean` | `list`、`delete pytorchjobs.kubeflow.org` |
+| `ksinfo`、`kqueue -A` | `get configmaps`（`kjob-system/kjob-cluster-status`，由第 2 節的服務開放） |
+
+檢查某個 namespace 的權限（全部是 `yes` 才完整）：
 
 ```bash
-SA=system:serviceaccount:<namespace>:default-editor
-for r in "create pytorchjobs.kubeflow.org" "list poddefaults.kubeflow.org" "list resourcequotas" "get pods/log" "list events" "create pods/exec"; do
-  echo "$r: $(kubectl auth can-i $r -n <namespace> --as=$SA)"
+NS=<namespace>; SA=system:serviceaccount:$NS:default-editor
+for r in "get pods" "list pods" "get pods/log" "create pods/exec" "list events" "list resourcequotas" \
+         "list poddefaults.kubeflow.org" "create pytorchjobs.kubeflow.org" "get pytorchjobs.kubeflow.org" \
+         "list pytorchjobs.kubeflow.org" "delete pytorchjobs.kubeflow.org"; do
+  echo "$r: $(kubectl auth can-i $r -n $NS --as=$SA)"
 done
+echo "status ConfigMap: $(kubectl auth can-i get configmaps/kjob-cluster-status -n kjob-system --as=$SA)"
+kubectl get notebooks -n $NS -o custom-columns=NAME:.metadata.name,SA:.spec.template.spec.serviceAccountName
 ```
+
+受限 GPU 節點不是 RBAC 權限，而是 taint／toleration（見第 3 節）；沒開通時 `ksub` 會在提交前直接報錯。
 
 ## 2. 叢集狀態服務（選用，讓使用者看到整個叢集）
 
@@ -52,7 +76,8 @@ kubectl delete -f deploy/cluster-status.yaml           # 完整移除
   `-g 節點名稱` 或 `-w 節點名稱`。建議在該節點部署 GPU Feature Discovery，讓型號正確顯示。
 * 受限節點用 taint 保護（例如 `example.com/restricted=true:NoSchedule`），再以 namespace 的 PodDefault 加上 toleration 開通。
   kjob 會把 Notebook 符合的 PodDefault selector 標籤帶到工作上，selector 為空的 PodDefault 也會套用到工作，
-  所以已開通的 namespace 不需另外設定。kjob 不會自行加 toleration。
+  所以已開通的 namespace 不需另外設定。Notebook 本身設定的 toleration 也會帶到工作；kjob 不會自行加 toleration。
+  沒開通的 namespace 指定受限型號時，`ksub` 會在提交前報錯（不會留下一個永遠排隊的工作）。
 * 簡稱表在 `kjob/core.py` 的 `GPU_PRODUCTS`；新增型號時可加一行，或讓使用者直接用 `ksinfo` 顯示的名稱。
 * MPS 共享 GPU：產品標籤以 `-SHARED` 結尾且 `nvidia.com/gpu.sharing-strategy=mps` 的節點。整張 GPU 的工作會自動
   避開這類節點；共享工作不帶 `/dev/shm` volume（device plugin 會掛）。MPS server 的 UID 必須與工作相容，

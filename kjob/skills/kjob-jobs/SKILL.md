@@ -20,6 +20,32 @@ kjob runs a script as a PyTorchJob that copies the Notebook: same image, same wo
 * Do not run heavy training directly in the Notebook terminal; submit it.
 * Report the job name, GPU type and log path to the user after submitting.
 
+## When a command fails: your tool's permission, or kjob?
+
+Before explaining any failure, decide which of these it is, and tell the user which one in plain words. Users
+otherwise conclude that kjob or the cluster is broken when only the assistant was not allowed to run the command.
+
+| What you see | Cause | Tell the user |
+|---|---|---|
+| No kjob output at all; your tool reports the command was denied, rejected, blocked, needs approval, or "the user doesn't want to proceed" (Claude Code also: "denied by the auto mode classifier") | **Your own tool's permission system.** The command never ran; kjob and the cluster are not involved | "This kjob command did not run: Claude Code (or your AI tool) blocked it, so it is not a kjob or cluster problem." Then say how to allow it (below) |
+| `kjob: cannot reach the Kubernetes API ...` while you run in a sandbox | Probably your tool's sandbox blocking network access | Same as above: the sandbox blocked kjob's connection; ask to allow kjob outside the sandbox. Outside a sandbox it is a cluster or network problem |
+| `kjob: Kubernetes API error (403 ...)` with `cannot ... resource` | The Notebook's service account lacks a Kubernetes permission (kjob did run) | Quote the message. Notebooks from the Kubeflow UI use `default-editor`, which has every permission; otherwise only the administrator can fix it |
+| `kjob: Kubernetes API error (403 ...)` with `exceeded quota` | Namespace quota full | Wait for other jobs or request less |
+| `... has no access to the requested GPUs ...` | Restricted GPU type not enabled for this namespace | Choose another type in `ksinfo`, or ask the administrator |
+| Any other line starting with `kjob:` | kjob checked something and refused (bad path, name in use, unknown GPU type ...) | Explain the message and fix the command |
+
+When your tool blocked the command:
+
+* Do not try to get around it (no `python -m kjob`, `kubectl`, scripts or other commands that do the same thing).
+  Say what was blocked and wait for the user.
+* Commands that only read: `kinfo`, `ksinfo`, `kqueue`, `kshow`, `klogs`, `kacct`. Commands that change the cluster:
+  `ksub`, `ksrun` (create jobs; `ksrun` deletes its job at the end), `kwait` (deletes the job when it ends), `kexec`
+  (runs a command inside a job), `kcancel`, `kclean` (delete jobs). An approval prompt for the second group is normal.
+* Claude Code: the user can approve the prompt, run `/permissions`, or add rules to `~/.claude/settings.json`, e.g.
+  `{"permissions": {"allow": ["Bash(kinfo:*)", "Bash(ksinfo:*)", "Bash(kqueue:*)", "Bash(kshow:*)", "Bash(klogs:*)",
+  "Bash(kacct:*)", "Bash(ksub:*)", "Bash(ksrun:*)", "Bash(kwait:*)", "Bash(kexec:*)"]}}`. Leave `kcancel` and
+  `kclean` out so deleting still asks. Other tools (Codex, Gemini CLI, ...) have their own approval settings.
+
 ## Workflow
 
 1. **Look at the environment**
@@ -101,7 +127,7 @@ kqueue -u mxxxxxxx        # one user's (namespace's) workloads
 |---|---|
 | `Insufficient nvidia.com/gpu` | all GPUs of that type are busy: wait, or choose another type with free GPUs in `ksinfo` |
 | `didn't match Pod's node affinity/selector` | the `-g`/`-w` combination matches no node; check names in `ksinfo` |
-| `untolerated taint {...}` | restricted node; this namespace has no access |
+| `untolerated taint {...}` | restricted node; this namespace has no access (newer kjob refuses such a job when it is submitted) |
 | `exceeded quota` / `exceeds namespace quota` | namespace GPU/CPU/memory quota is used up (Notebooks count too): stop an idle GPU Notebook or wait |
 | `Insufficient memory` / `cpu` | lower `--mem` / `-c` |
 

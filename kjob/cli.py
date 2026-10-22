@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -268,6 +269,28 @@ def _check_node(node: str | None, gpus: int) -> None:
         raise ValueError(f"{node} is not a GPU node in this cluster; GPU nodes: {', '.join(sorted(names))}.")
 
 
+def _check_access(gpu_types: list[str], node: str | None, exclude: list[str], gpus: int) -> None:
+    """Refuse a job that could only run on restricted nodes this namespace may not use: it would wait forever."""
+    if not gpus:
+        return
+    try:
+        nodes = cluster.load_snapshot().get("nodes", [])
+    except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
+        return
+    wanted = {core.GPU_PRODUCTS.get(g, g) for g in gpu_types}
+    candidates = [n for n in nodes if n["name"] not in exclude and (not node or n["name"] == node)
+                  and (n["product"] in wanted if wanted else node or n.get("sharing") != "mps")]
+    if not candidates or not all(n["restricted"] for n in candidates):
+        return
+    tol = _my_tolerations()
+    if tol is None or any(all(_tolerated(x, tol) for x in n["restricted"]) for n in candidates):
+        return
+    where = ", ".join(f"{n['name']} ({cluster.node_type(n)}, {', '.join(n['restricted'])})" for n in candidates)
+    raise ValueError(f"Namespace {core.current_namespace()} has no access to the requested GPUs on {where}, so the job "
+                     "would wait forever. Ask the cluster administrator to enable it for your namespace, or choose another "
+                     "GPU type (ksinfo shows 'no access' in the NOTE column).")
+
+
 def _spec(a) -> core.JobSpec:
     name = a.job_name or core.unique_name(Path(a.script).stem)
     if any("=" not in e for e in a.env):
@@ -278,6 +301,7 @@ def _spec(a) -> core.JobSpec:
     gpu_types, node = resolve_gpu_types([g for g in a.gpu_type.split(",") if g], a.nodelist)
     if a.nodelist and a.gpus:
         _check_node(node, a.gpus)
+    _check_access(gpu_types, node, [n for n in a.exclude.split(",") if n], a.gpus)
     spec = core.JobSpec(name=name, script=a.script, args=a.args, gpus=a.gpus, cpus=a.cpus, memory=a.mem, shm=a.shm,
                         gpu_types=gpu_types, node=node,
                         exclude_nodes=[n for n in a.exclude.split(",") if n], interpreter=a.python, env=env,
@@ -622,16 +646,18 @@ def cmd_acct(a) -> int:
 
 # ---------- cluster / environment ----------
 def _my_tolerations() -> list | None:
-    """Tolerations a job from this notebook gets from the namespace PodDefaults (None when unknown)."""
+    """Tolerations a job from this notebook gets: the notebook's own and the namespace PodDefaults' (None when unknown)."""
     try:
         ns = core.current_namespace()
-        api = core.client.CoreV1Api()
-        labels = api.read_namespaced_pod(core.current_notebook(), ns).metadata.labels or {}
+        pod = core.client.CoreV1Api().read_namespaced_pod(core.current_notebook(), ns)
         pds = core.client.CustomObjectsApi().list_namespaced_custom_object("kubeflow.org", "v1alpha1", ns, "poddefaults")["items"]
     except (ApiException, HTTPError, ValueError):
         return None
-    return [t for pd in pds if core._matches(pd["spec"].get("selector", {}), labels)
-            for t in pd["spec"].get("tolerations", [])]
+    labels = pod.metadata.labels or {}
+    own = [core.client.ApiClient().sanitize_for_serialization(t) for t in pod.spec.tolerations or []
+           if not (t.key or "").startswith("node.kubernetes.io/")]
+    return own + [t for pd in pds if core._matches(pd["spec"].get("selector", {}), labels)
+                  for t in pd["spec"].get("tolerations", [])]
 
 
 def _tolerated(taint: str, tolerations: list) -> bool:
@@ -889,7 +915,6 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     ap = build_parser()
     a = ap.parse_args(argv)
-    err = a.parser.error
     if a.cmd in ("submit", "run"):
         cli_only = a
         extra = script_directives(a.script)
@@ -913,18 +938,48 @@ def main(argv=None) -> int:
     except BrokenPipeError:                 # e.g. klogs ... | head
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 0
-    except ValueError as e:
-        err(str(e))
+    except ValueError as e:   # kjob refused the request: the reason only, not the whole usage text
+        a.parser.exit(2, f"kjob: {e}\n")
     except cluster.ClusterViewUnavailable as e:
         ap.exit(1, f"kjob: {e}\n")
     except ApiException as e:
         if e.status == 409 and a.cmd in ("submit", "run"):
             ap.exit(1, f"kjob: a job named {_job_name(getattr(a, 'job_name', '') or '')} already exists; choose another -J or "
                        f"kcancel it first\n")
-        ap.exit(1, f"kjob: Kubernetes API error ({e.status}): {e.reason}\n")
-    except HTTPError as e:  # connection refused/reset, timeouts: the job itself is unaffected
-        ap.exit(1, f"kjob: lost connection to the Kubernetes API ({type(e).__name__}); submitted jobs keep running, "
-                   f"check them later with kqueue / kwait NAME\n")
+        ap.exit(1, _api_error(e) + "\n")
+    except HTTPError as e:  # connection refused/reset, timeouts: a job submitted before this is unaffected
+        ap.exit(1, f"kjob: cannot reach the Kubernetes API ({type(e).__name__}: {str(e)[:200]})\n"
+                   "  Jobs submitted before this keep running; check with kqueue / kwait NAME.\n"
+                   "  Inside an AI tool's sandbox (e.g. Claude Code), network access to the API server may be blocked.\n")
+    except OSError as e:
+        where = f": {e.filename}" if e.filename else ""
+        hint = "\n  Check that you can write there (logs go to ~/kjob-logs; use -o to choose another directory)." \
+            if isinstance(e, PermissionError) else ""
+        ap.exit(1, f"kjob: {e.strerror or e}{where}{hint}\n")
+    except Exception as e:  # anything else: one line instead of a traceback
+        if os.environ.get("KJOB_DEBUG"):
+            raise
+        ap.exit(1, f"kjob: unexpected error {type(e).__name__}: {e}\n"
+                   "  Run again with KJOB_DEBUG=1 to see the traceback, and report it.\n")
+
+
+def _api_error(e: ApiException) -> str:
+    """The Kubernetes Status message (what was refused, for whom) plus what to do about it."""
+    try:
+        msg = json.loads(e.body or "{}").get("message") or ""
+    except (ValueError, TypeError, AttributeError):
+        msg = ""
+    out = f"kjob: Kubernetes API error ({e.status} {e.reason}): {msg or e.reason}"
+    if e.status == 403 and "exceeded quota" in msg:
+        return out + "\n  The namespace quota is used up: see kinfo, wait for your other jobs, or request less."
+    if e.status == 403:
+        return out + ("\n  kjob acts as the Notebook's service account. Notebooks created in the Kubeflow UI run as "
+                      "default-editor, which has every permission kjob needs.\n  If the account above is not "
+                      "default-editor, recreate the Notebook from the Kubeflow UI; otherwise ask the cluster "
+                      "administrator (permissions are listed in docs/ADMIN.md).")
+    if e.status == 401:
+        return out + "\n  The Notebook's service-account token was rejected; restart the Notebook."
+    return out
 
 
 # console scripts installed by pip (pyproject.toml); the bin/ wrappers do the same for a source checkout

@@ -45,8 +45,12 @@ kinfo                     # notebook, namespace, inherited volumes, GPU quota
 ksinfo                    # cluster GPU types and free GPUs (needs the administrator's status service)
 ```
 
-* `kinfo` fails with a 403 error: the Notebook's service account lacks permissions. Only the cluster administrator can
-  fix this; tell the user.
+* Your AI tool blocked or asked to approve the command (no kjob output, a "denied"/"blocked"/approval message): the
+  command never ran, so this is not a kjob or cluster problem. Tell the user exactly that, and see "When a command
+  fails" in the `kjob-jobs` skill for the commands to allow. Do not work around it.
+* `kinfo` fails with `Kubernetes API error (403 ...)`: the Notebook's service account lacks permissions (Notebooks
+  created in the Kubeflow UI use `default-editor`, which has them). Only the cluster administrator can fix this; tell
+  the user and quote the message.
 * `ksinfo` says "cluster-wide view is not available": the administrator has not deployed the status service.
   Job submission still works; only the cluster overview is missing.
 

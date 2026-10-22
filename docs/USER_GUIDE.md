@@ -284,6 +284,11 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 | `ModuleNotFoundError` | 套件只裝在 Notebook 系統目錄；改用 `pip install --user` 或 `/home/jovyan` 上的虛擬環境 + `--python` |
 | `DeadlineExceeded`（ksrun／kwait／kshow 顯示） | 超過 `-t` 時間上限；程式有收到 SIGTERM，可在 handler 存 checkpoint 後續跑 |
 | `cuda: False` | 用了 `-G 0`，或 image／環境沒有 CUDA 版 PyTorch |
+| `kjob: Kubernetes API error (403 Forbidden): ... cannot create resource "pytorchjobs" ...` | Notebook 的帳號沒有這個權限。訊息裡會寫是哪個帳號、缺什麼。Kubeflow 介面建立的 Notebook 用 `default-editor`，權限是齊的；不是的話重新從介面建 Notebook，否則請管理員處理（[ADMIN.md](ADMIN.md) 有權限清單） |
+| `kjob: Kubernetes API error (403 Forbidden): exceeded quota` | namespace 配額用完（Notebook 也算在內）：看 `kinfo`，等其他工作結束或少要一點 |
+| `has no access to the requested GPUs on ...` | 指定的是受限 GPU，這個 namespace 沒開通（`ksinfo` 的 NOTE 是 `no access`）：換型號或請管理員開通 |
+| `kjob: cannot reach the Kubernetes API` | 連不到叢集。之前已送出的工作不受影響（用 `kqueue` 確認）；在 AI 工具的 sandbox 裡執行時，多半是 sandbox 擋住網路 |
+| `kjob: unexpected error ...` | kjob 的問題：用 `KJOB_DEBUG=1 ksub ...` 重跑取得完整訊息並回報 |
 | `no kernel image is available`、`sm_120 is not compatible` | PyTorch 不支援這張卡。V100 和 RTX PRO 6000 都要能跑（例如 `-g v100,rtxpro6000`）請用 `torch==2.8.0`（`--index-url https://download.pytorch.org/whl/cu128`，Python 3.9 以上的 venv）：2.7 以前不支援 RTX PRO 6000，較新的版本（實測 2.11）不支援 V100，不指定版本就會裝到它 |
 
 ## AI 助手 skill
@@ -308,6 +313,32 @@ kjob install-skills --dir 其他工具的skills目錄
 ```
 
 不支援 skill 的 AI 工具，可以把這兩個 `SKILL.md` 的內容貼給它當說明。
+
+### 用 AI 執行時常見的問題
+
+AI 工具（Claude Code、Codex 等）執行指令前有自己的權限機制。被它擋下時，**kjob 根本沒有執行**，跟 kjob 或叢集無關。
+skill 會要求 AI 明確告訴你是不是這種情況。
+
+| 看到的狀況 | 原因 | 處理 |
+|---|---|---|
+| 沒有任何 `kjob:` 開頭的輸出，AI 說指令被拒絕、需要核准、`denied`、`blocked`，或 Claude Code 的 `denied by the auto mode classifier` | AI 工具的權限機制擋下了指令 | 按下核准，或把 kjob 指令加入允許清單（下面） |
+| `kjob: cannot reach the Kubernetes API`，而 AI 在 sandbox 裡執行 | sandbox 擋住了連到叢集的網路 | 讓 kjob 指令在 sandbox 外執行，或在 sandbox 設定允許連線 |
+| `kjob: Kubernetes API error (403 ...)` | kjob 有執行，是 Notebook 的帳號沒有權限 | 見下方錯誤排解表 |
+
+哪些指令會改動叢集：
+
+| 只讀取（可以放心允許） | 會建立、刪除或進入工作 |
+|---|---|
+| `kinfo`、`ksinfo`、`kqueue`、`kshow`、`klogs`、`kacct` | `ksub`、`ksrun`（建立工作；`ksrun` 結束時刪除）、`kwait`（結束時刪除工作）、`kexec`（在工作裡執行指令）、`kcancel`、`kclean`（刪除工作） |
+
+Claude Code 可以在 `/permissions` 設定，或寫進 `~/.claude/settings.json`（`kcancel`、`kclean` 不放進去，刪除時仍會先問）：
+
+```json
+{"permissions": {"allow": ["Bash(kinfo:*)", "Bash(ksinfo:*)", "Bash(kqueue:*)", "Bash(kshow:*)", "Bash(klogs:*)",
+                           "Bash(kacct:*)", "Bash(ksub:*)", "Bash(ksrun:*)", "Bash(kwait:*)", "Bash(kexec:*)"]}}
+```
+
+其他 AI 工具請用它自己的核准設定。
 
 ## Python API
 

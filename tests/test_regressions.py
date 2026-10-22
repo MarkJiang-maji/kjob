@@ -428,5 +428,127 @@ class AccountingTests(unittest.TestCase):
                 self.assertEqual(core.read_history()[0]['run_id'], j.run_id)
 
 
+def run_main(exc, cmd='queue'):
+    """cli.main with the command raising exc; returns (exit code, stderr)."""
+    err = io.StringIO()
+    def boom(a):
+        raise exc
+    with mock.patch.object(cli, 'cmd_queue', boom), mock.patch.object(cli, 'cmd_submit', boom), \
+         mock.patch.object(cli, 'auto_install_skills'), mock.patch.object(core, '_load_config'), mock.patch('sys.stderr', err):
+        try:
+            code = cli.main([cmd] + (['x.py'] if cmd == 'submit' else []))
+        except SystemExit as e:
+            code = e.code
+    return code, err.getvalue()
+
+
+def api_error(status, message, reason='Forbidden'):
+    e = core.ApiException(status=status, reason=reason)
+    e.body = core.json.dumps({'kind': 'Status', 'message': message, 'reason': reason, 'code': status})
+    return e
+
+
+class ErrorOutputTests(unittest.TestCase):
+    def test_forbidden_shows_kubernetes_reason_and_what_to_do(self):
+        code, err = run_main(api_error(403, 'pytorchjobs.kubeflow.org is forbidden: User "system:serviceaccount:me:default" '
+                                            'cannot create resource "pytorchjobs" in API group "kubeflow.org" in the namespace "me"'))
+        self.assertEqual(code, 1)
+        self.assertIn('cannot create resource "pytorchjobs"', err)                # what is missing, and for whom
+        self.assertIn('default-editor', err)                                       # how a Notebook normally gets it
+        self.assertIn('ADMIN.md', err)
+
+    def test_quota_rejection_is_not_reported_as_a_permission_problem(self):
+        code, err = run_main(api_error(403, 'exceeded quota: kf-resource-quota, requested: requests.nvidia.com/gpu=4'))
+        self.assertIn('exceeded quota', err)
+        self.assertNotIn('default-editor', err)
+
+    def test_other_api_errors_keep_the_message(self):
+        code, err = run_main(api_error(422, 'PyTorchJob.kubeflow.org "x" is invalid: spec.foo: Invalid value', 'Invalid'))
+        self.assertIn('422', err)
+        self.assertIn('is invalid: spec.foo', err)
+
+    def test_unreachable_api_mentions_sandbox_and_does_not_claim_a_submission(self):
+        code, err = run_main(core_http_error(), cmd='submit')
+        self.assertEqual(code, 1)
+        self.assertIn('cannot reach the Kubernetes API', err)
+        self.assertIn('sandbox', err)
+        self.assertIn('kqueue', err)                                               # how to check whether it got in
+
+    def test_file_permission_error_names_the_path(self):
+        code, err = run_main(PermissionError(13, 'Permission denied', '/home/jovyan/kjob-logs'))
+        self.assertEqual(code, 1)
+        self.assertIn('/home/jovyan/kjob-logs', err)
+        self.assertNotIn('Traceback', err)
+
+    def test_refusals_print_the_reason_without_the_usage_text(self):
+        code, err = run_main(ValueError('Namespace me has no access to the requested GPUs on rtxpro6000'), cmd='submit')
+        self.assertEqual(code, 2)
+        self.assertTrue(err.startswith('kjob: Namespace me has no access'), err)
+        self.assertNotIn('usage:', err)
+
+    def test_unexpected_error_is_one_line_unless_debugging(self):
+        code, err = run_main(RuntimeError('boom'))
+        self.assertEqual(code, 1)
+        self.assertIn('RuntimeError: boom', err)
+        self.assertIn('KJOB_DEBUG=1', err)
+        with mock.patch.dict(cli.os.environ, {'KJOB_DEBUG': '1'}), self.assertRaises(RuntimeError):
+            run_main(RuntimeError('boom'))
+
+
+def core_http_error():
+    from urllib3.exceptions import MaxRetryError
+    return MaxRetryError(None, '/apis/kubeflow.org/v1/namespaces/me/pytorchjobs', 'Connection refused')
+
+
+class RestrictedAccessTests(unittest.TestCase):
+    SNAP = {'nodes': [
+        {'name': 'hs5800-3', 'product': 'Tesla-V100-SXM2-16GB', 'restricted': [], 'sharing': '', 'gpus': 8},
+        {'name': 'rtxpro6000', 'product': 'NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition',
+         'restricted': ['restricted-gpu=advance'], 'sharing': '', 'gpus': 8}]}
+    RTX = 'NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition'
+
+    def check(self, types, node=None, tol=(), exclude=()):
+        with mock.patch.object(cluster_mod(), 'load_snapshot', return_value=self.SNAP), \
+             mock.patch.object(cli, '_my_tolerations', return_value=list(tol)), \
+             mock.patch.object(core, 'current_namespace', return_value='me'):
+            cli._check_access(types, node, list(exclude), 1)
+
+    def test_restricted_type_without_access_is_refused_before_submitting(self):
+        with self.assertRaisesRegex(ValueError, r'(?s)no access.*rtxpro6000.*administrator'):
+            self.check([self.RTX])
+        with self.assertRaisesRegex(ValueError, 'no access'):
+            self.check([], node='rtxpro6000')
+
+    def test_allowed_or_mixed_requests_pass(self):
+        self.check([self.RTX], tol=[{'key': 'restricted-gpu', 'operator': 'Equal', 'value': 'advance', 'effect': 'NoSchedule'}])
+        self.check(['v100', self.RTX])                       # V100 is usable, so the job can start
+        self.check([])                                       # any GPU
+        with self.assertRaisesRegex(ValueError, 'no access'):
+            self.check(['v100', self.RTX], exclude=['hs5800-3'])
+
+    def test_unknown_tolerations_skip_the_check(self):
+        with mock.patch.object(cluster_mod(), 'load_snapshot', return_value=self.SNAP), \
+             mock.patch.object(cli, '_my_tolerations', return_value=None):
+            cli._check_access([self.RTX], None, [], 1)
+
+    def test_notebook_tolerations_count(self):
+        p = notebook_pod()
+        p.spec.tolerations = [client.V1Toleration(key='restricted-gpu', operator='Equal', value='advance', effect='NoSchedule'),
+                              client.V1Toleration(key='node.kubernetes.io/not-ready', operator='Exists', effect='NoExecute')]
+        c, o = mock.Mock(), mock.Mock()
+        c.read_namespaced_pod.return_value = p
+        o.list_namespaced_custom_object.return_value = {'items': []}
+        with mock.patch.object(core.client, 'CoreV1Api', return_value=c), mock.patch.object(core.client, 'CustomObjectsApi', return_value=o), \
+             mock.patch.object(core, 'current_namespace', return_value='me'), mock.patch.object(core, 'current_notebook', return_value='nb-0'):
+            tol = cli._my_tolerations()
+        self.assertIn({'key': 'restricted-gpu', 'operator': 'Equal', 'value': 'advance', 'effect': 'NoSchedule'}, tol)
+        self.assertFalse(any((t.get('key') or '').startswith('node.kubernetes.io/') for t in tol))
+
+
+def cluster_mod():
+    from kjob import cluster
+    return cluster
+
+
 if __name__ == '__main__':
     unittest.main()
