@@ -284,6 +284,7 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 | `ModuleNotFoundError` | 套件只裝在 Notebook 系統目錄；改用 `pip install --user` 或 `/home/jovyan` 上的虛擬環境 + `--python` |
 | `DeadlineExceeded`（ksrun／kwait／kshow 顯示） | 超過 `-t` 時間上限；程式有收到 SIGTERM，可在 handler 存 checkpoint 後續跑 |
 | `cuda: False` | 用了 `-G 0`，或 image／環境沒有 CUDA 版 PyTorch |
+| `no kernel image is available`、`sm_120 is not compatible` | PyTorch 不支援這張卡。V100 和 RTX PRO 6000 都要能跑（例如 `-g v100,rtxpro6000`）請用 `torch==2.8.0`（`--index-url https://download.pytorch.org/whl/cu128`，Python 3.9 以上的 venv）：2.7 以前不支援 RTX PRO 6000，較新的版本（實測 2.11）不支援 V100，不指定版本就會裝到它 |
 
 ## AI 助手 skill
 
