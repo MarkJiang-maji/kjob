@@ -114,7 +114,7 @@ class StorageTests(unittest.TestCase):
 class SubmissionTests(unittest.TestCase):
     def test_default_request_fits_teaching_quota(self):
         s = core.JobSpec(name='t', script='train.py')
-        self.assertEqual((s.cpus, s.memory, s.shm), (1, '2Gi', '256Mi'))
+        self.assertEqual((s.cpus, s.memory, s.shm), (1, '2Gi', None))
 
     def test_invalid_resources_and_mixed_sharing_fail_early(self):
         for values in ({'gpus': -1}, {'cpus': 0}, {'ttl_seconds': -1}, {'memory': 'nan'}, {'memory': 'bogus'},

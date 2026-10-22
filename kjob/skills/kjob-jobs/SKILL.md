@@ -99,8 +99,8 @@ When your tool blocked the command:
 | `-w, --nodelist` / `-x, --exclude` | - | run on / avoid specific nodes |
 | `-c, --cpus` | 1 | CPU cores |
 | `--mem` | 2Gi | memory (Kubernetes units: `32Gi`) |
-| `--shm` | 256Mi | `/dev/shm`; raise to `8Gi`+ for PyTorch DataLoader with many workers |
-| `-t, --time` | none | time limit from start (queueing not counted): `30` (min), `2:00:00`, `1-12:00:00`, `12h`, `2d`. At the limit the script gets SIGTERM and 30 s to save |
+| `--shm` | same as `--mem` | `/dev/shm` size limit; its use counts toward `--mem`, so raise `--mem` for DataLoaders with many workers |
+| `-t, --time` | none | time limit counted from when the pod is placed on a node (image download and start-up included, queueing not): `30` (min), `2:00:00`, `1-12:00:00`, `12h`, `2d`. At the limit the script gets SIGTERM and 30 s to save |
 | `--python` | notebook's python3 | interpreter for `.py` (e.g. a venv on `/home/jovyan`) |
 | `--env KEY=VALUE` | - | extra environment variable, repeatable |
 | `-D, --chdir` | current dir | working directory |
@@ -134,11 +134,12 @@ kqueue -u mxxxxxxx        # one user's (namespace's) workloads
 ## Why did it fail?
 
 * `exit code 137, OOMKilled`: out of memory: raise `--mem`. (137 without OOMKilled: killed after the 30 s stop grace period.)
-* `Bus error` / DataLoader shared-memory errors: raise `--shm` (e.g. `--shm 16Gi`).
+* `Bus error` / `DataLoader worker ... exited unexpectedly`: shared memory ran out. `/dev/shm` defaults to the `--mem` limit and its use counts toward it: raise `--mem` (and `--shm` if it was set).
 * `CUDA out of memory`: smaller batch, or a GPU type with more memory.
 * `No such file or directory`: script or data not on a shared volume, or a relative path; use absolute paths.
 * `ModuleNotFoundError`: package installed somewhere the job cannot see; see step 2.
-* Stopped at the time limit: `DeadlineExceeded` (ksrun/kwait/kshow), `STOPPED` in kacct. Training code should handle
+* Stopped at the time limit: "stopped at the time limit" / `DeadlineExceeded` (ksrun/kwait/kshow; they exit with 124 even if the
+  script saved and exited 0), `STOPPED` in kacct (`CANCELLED`: deleted by kcancel before it could log an end). Training code should handle
   SIGTERM (save a checkpoint) since it gets 30 s before being killed; resubmit with a larger `-t` and
   resume from a checkpoint.
 

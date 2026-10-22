@@ -39,12 +39,13 @@ def _iso(ts) -> str | None:
 
 
 def _requests(pod, key: str) -> float:
-    total = 0.0
-    for c in pod.spec.containers or []:
+    """What the scheduler reserves: the larger of the containers' sum and any one init container, plus overhead."""
+    def req(c):
         v = ((c.resources and c.resources.requests) or {}).get(key)
-        if v is not None:
-            total += float(parse_quantity(v))
-    return total
+        return float(parse_quantity(v)) if v is not None else 0.0
+    total = max([sum(req(c) for c in pod.spec.containers or [])] + [req(c) for c in pod.spec.init_containers or []])
+    overhead = (pod.spec.overhead or {}).get(key)
+    return total + (float(parse_quantity(overhead)) if overhead is not None else 0.0)
 
 
 def _affinity_values(pod, key: str) -> list[str]:
@@ -55,6 +56,9 @@ def _affinity_values(pod, key: str) -> list[str]:
         for e in term.match_expressions or []:
             if e.key == key and e.operator == "In":
                 values += e.values or []
+        if key == "kubernetes.io/hostname":     # kjob pins nodes by name: matchFields metadata.name
+            values += [v for e in term.match_fields or [] if e.key == "metadata.name" and e.operator == "In"
+                       for v in e.values or []]
     if pod.spec.node_selector and key in pod.spec.node_selector:
         values.append(pod.spec.node_selector[key])
     return values
@@ -95,6 +99,8 @@ def build_snapshot(core_api: client.CoreV1Api | None = None, hide_names: bool = 
             "restricted": sorted({f"{t.key}={t.value}" if t.value else t.key for t in n.spec.taints or []
                                   if t.effect in ("NoSchedule", "NoExecute")
                                   and not t.key.startswith("node.kubernetes.io/")}),  # cordon/not-ready: shown as STATE
+            "taints": [{"key": t.key, "value": t.value or "", "effect": t.effect} for t in n.spec.taints or []
+                       if t.effect in ("NoSchedule", "NoExecute") and not t.key.startswith("node.kubernetes.io/")],
         }
     workloads = []
     now = _now()

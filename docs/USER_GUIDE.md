@@ -71,8 +71,8 @@ ksrun [選項] 腳本 [腳本參數...]     提交、即時輸出、結束後刪
 | `-x, --exclude NODE[,NODE]` | — | 避開節點 |
 | `-c, --cpus N` | `1` | CPU 核心數（requests = limits） |
 | `--mem SIZE` | `2Gi` | 記憶體上限，Kubernetes 格式：`512Mi`、`32Gi`。超過會被 OOMKilled |
-| `--shm SIZE` | `256Mi` | `/dev/shm` 大小；PyTorch DataLoader 多 worker 時建議 `8Gi` 以上 |
-| `-t, --time TIME` | 無 | 時間上限，從開始執行算起（排隊時間不算）。時間到程式先收到 SIGTERM，有 30 秒存檔，之後強制結束。格式：`30`（分）、`30:00`（分:秒）、`2:00:00`、`1-12`（天-時）、`1-12:30:00`、`90m`、`12h`、`2d` |
+| `--shm SIZE` | 同 `--mem` | `/dev/shm` 上限。只是上限、不會預先占用，用量算在 `--mem` 裡；DataLoader worker 多時加大 `--mem` |
+| `-t, --time TIME` | 無 | 時間上限，從工作排到節點開始算：包含下載 image、啟動容器的時間，不含排隊時間。時間到程式先收到 SIGTERM，有 30 秒存檔，之後強制結束。格式：`30`（分）、`30:00`（分:秒）、`2:00:00`、`1-12`（天-時）、`1-12:30:00`、`90m`、`12h`、`2d` |
 | `--python PATH` | 目前的 python3 | 執行 `.py` 用的直譯器，例如 `/home/jovyan/venv/bin/python` |
 | `--env KEY=VALUE` | — | 額外環境變數，可重複；`KJOB_NAME`、`KJOB_NODE`、`PYTHONUNBUFFERED`、`NVIDIA_VISIBLE_DEVICES`、`CUDA_MPS_*` 等保留變數不能覆蓋 |
 | `-D, --chdir DIR` | 目前目錄 | 工作的工作目錄 |
@@ -164,7 +164,7 @@ ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
 
 * 路徑用絕對路徑，程式、資料、輸出放在 `kinfo` 列出的磁碟上。
 * 多張 GPU 要程式本身支援（DDP / `torchrun`），否則只會用到第一張；`--nproc_per_node` 要等於 GPU 數（可用 `NGPU=$(python3 -c "import torch; print(torch.cuda.device_count())")` 自動取得）。
-* PyTorch DataLoader 的 `num_workers` 大時加大 `--shm`（例如 `--shm 16Gi`）。
+* PyTorch DataLoader 的 worker 透過 `/dev/shm` 傳資料；它的上限預設跟 `--mem` 一樣，用量也算在 `--mem` 裡，worker 多時加大 `--mem`。
 * 只在 Notebook 裝的套件：用 `pip install --user`（裝在 `~/.local`），或在 `/home/jovyan` 建虛擬環境。
 
 ## 查看與管理自己的工作
@@ -180,9 +180,9 @@ ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
 | `klogs NAME -o DIR` | 日誌不在預設位置時指定目錄 |
 | `kexec NAME 指令...` | 在執行中的工作容器裡跑一個指令並回傳它的結束代碼，例如 `kexec NAME nvidia-smi` 看 GPU 使用率（≈ 國網 `srun --jobid=ID`） |
 | `kexec NAME` | 開一個互動 shell 進到執行中的工作（≈ `srun --jobid=ID --pty bash`），`exit` 離開，工作不受影響；需要在終端機裡執行 |
-| `kwait NAME` | 等到結束（排隊中會顯示原因），回傳程式的結束代碼，結束後刪除工作物件 |
+| `kwait NAME` | 等到結束（排隊中會顯示原因），回傳程式的結束代碼（`-t` 時間到被停止時回傳 124），結束後刪除工作物件 |
 | `kwait NAME --keep` | 同上，但不刪除工作物件 |
-| `kacct` | 最近 20 筆提交紀錄：提交時間、GPU、型號/節點、STATE（COMPLETED/FAILED/STOPPED/RUNNING/PENDING/ENDED?）、EXIT、ELAPSED |
+| `kacct` | 最近 20 筆提交紀錄：提交時間、GPU、型號/節點、STATE（COMPLETED/FAILED/STOPPED/CANCELLED/RUNNING/PENDING/ENDED?）、EXIT、ELAPSED |
 | `kacct -n 0` | 全部紀錄（`-n N` 最近 N 筆） |
 | `kcancel NAME [NAME...]` | 取消／刪除工作 |
 | `kcancel --finished` | 刪除這個 Notebook 提交、已結束的工作 |
@@ -191,7 +191,7 @@ ksub -G 1 train.sh            # 命令列的選項優先，這次只要 1 張
 | `kclean [--all-notebooks]` | 等於 `kcancel --finished` |
 | `kinfo` | Notebook 名稱、namespace、image、工作目錄、會帶過去的磁碟、沒帶過去的磁碟與原因、配額使用量 |
 
-`kacct` 的 `STOPPED` 表示被時間上限或 `kcancel` 停止；`ENDED?` 表示工作已不存在、日誌也沒有結束代碼（例如還沒開始就被刪除）。
+`kacct` 的 `STOPPED` 表示被時間上限或 `kcancel` 停止（日誌有記到）；`CANCELLED` 表示在結束前被 `kcancel` 刪除、日誌沒來得及記到（例如剛啟動就取消）；`ENDED?` 表示工作已不存在、日誌也沒有結束代碼（例如被別處刪除，或日誌寫不進去）。
 每次提交有自己的 run id，寫在日誌的 start 行，所以同名工作重交時，舊工作的結果不會算到新工作上。
 同一個名稱重複使用時，依時間把日誌裡的每次執行對到它之前最近的那次提交；從未開始的提交顯示 `ENDED?`。
 工作在別的節點寫日誌，Notebook 端的 NFS 快取可能要 30–60 秒才看到最新內容，剛結束的工作可能暫時顯示 `ENDED?`。
@@ -278,11 +278,12 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 | 現象 | 原因／處理 |
 |---|---|
 | `exit code 137, OOMKilled` | 記憶體超過 `--mem`（只有 137 而沒有 OOMKilled：被強制結束，例如停止後 30 秒內沒結束） |
-| `Bus error`、`DataLoader worker ... killed` | `/dev/shm` 太小，加大 `--shm` |
+| `Bus error`、`DataLoader worker ... killed`、`exited unexpectedly` | `/dev/shm` 不夠：加大 `--mem`（`/dev/shm` 上限預設同 `--mem`）；若有指定 `--shm` 也一起加大 |
 | `CUDA out of memory` | 降低 batch size，或換記憶體大的 GPU |
 | `No such file or directory` | 檔案不在共用磁碟、或用了相對路徑 |
 | `ModuleNotFoundError` | 套件只裝在 Notebook 系統目錄；改用 `pip install --user` 或 `/home/jovyan` 上的虛擬環境 + `--python` |
-| `DeadlineExceeded`（ksrun／kwait／kshow 顯示） | 超過 `-t` 時間上限；程式有收到 SIGTERM，可在 handler 存 checkpoint 後續跑 |
+| `stopped at the time limit`、`DeadlineExceeded`（ksrun／kwait／kshow 顯示） | 超過 `-t` 時間上限；程式有收到 SIGTERM，可在 handler 存 checkpoint 後續跑。即使程式存完檔正常結束，`ksrun`／`kwait` 也回傳 124，不當成成功 |
+| `cannot write the log file ...; the script was not started` | 日誌目錄不存在、被同名檔案擋住或沒有寫入權限，程式沒有執行。檢查 `-o` 指定的目錄（預設 `~/kjob-logs`） |
 | `cuda: False` | 用了 `-G 0`，或 image／環境沒有 CUDA 版 PyTorch |
 | `kjob: Kubernetes API error (403 Forbidden): ... cannot create resource "pytorchjobs" ...` | Notebook 的帳號沒有這個權限。訊息裡會寫是哪個帳號、缺什麼。Kubeflow 介面建立的 Notebook 用 `default-editor`，權限是齊的；不是的話重新從介面建 Notebook，否則請管理員處理（[ADMIN.md](ADMIN.md) 有權限清單） |
 | `kjob: Kubernetes API error (403 Forbidden): exceeded quota` | namespace 配額用完（Notebook 也算在內）：看 `kinfo`，等其他工作結束或少要一點 |

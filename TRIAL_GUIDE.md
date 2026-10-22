@@ -116,7 +116,7 @@ ksub -J demo1 ~/kjob-demo/train.sh
 Submitted job demo1  (log: /home/jovyan/kjob-logs/demo1.log)
 ```
 
-`-t`（或檔案裡的 `#SBATCH -t`）是時間上限，從開始執行算起，時間到工作會被停止（格式：`30` 分鐘、`2:00:00`、
+`-t`（或檔案裡的 `#SBATCH -t`）是時間上限，從工作排到節點開始算（含下載 image，不含排隊），時間到工作會被停止（格式：`30` 分鐘、`2:00:00`、
 `1-12:00:00`、`12h`）。停止前程式會先收到 SIGTERM，有 30 秒可以存 checkpoint。
 
 ## 6. 查看工作
@@ -201,7 +201,7 @@ kclean             # 刪除這個 Notebook 已結束的工作物件
 | 一直 `Pending` | `kshow 名稱` 看 event。`Insufficient nvidia.com/gpu`：該型號滿了，等候或換型號；`exceeded quota`：namespace GPU 配額用完（關掉閒置的 GPU Notebook）；`untolerated taint`：沒有該節點權限 |
 | `exit code 137, OOMKilled` | 記憶體不足，加大 `--mem` |
 | `DeadlineExceeded` | 超過 `-t` 時間上限，加大 `-t` 或從 checkpoint 續跑 |
-| `Bus error`、DataLoader 錯誤 | 加大 `--shm` |
+| `Bus error`、DataLoader 錯誤 | 加大 `--mem`（`/dev/shm` 上限預設同 `--mem`） |
 | `No such file or directory` | 檔案不在共用磁碟或用了相對路徑 |
 | `ModuleNotFoundError` | 套件裝在工作看不到的地方，見第 7 節 |
 | `ksub: command not found` | `export PATH="$HOME/.local/bin:$PATH"` |

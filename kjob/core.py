@@ -47,7 +47,8 @@ MANAGED_VOLUME_PREFIXES = ("gs-", "ns-")
 # containers; a second /dev/shm volume makes the container fail with "Duplicate mount point: /dev/shm".
 SHARING_STRATEGY_LABEL = "nvidia.com/gpu.sharing-strategy"
 TERMINAL = ("Succeeded", "Failed", "Deleted")  # Deleted: the job is gone (kcancel elsewhere, TTL)
-DEFAULT_CPUS, DEFAULT_MEMORY, DEFAULT_SHM = 1, "2Gi", "256Mi"
+DEFAULT_CPUS, DEFAULT_MEMORY = 1, "2Gi"
+DEFAULT_SHM = None   # /dev/shm limit = --mem: only a cap (its use counts toward memory), big enough for DataLoader workers
 
 
 def unique_name(stem: str) -> str:
@@ -131,6 +132,24 @@ def main_container(pod: client.V1Pod) -> client.V1Container:
                      f"({', '.join(c.name for c in candidates)}); set the kubectl.kubernetes.io/default-container annotation.")
 
 
+# Volume sources a job on another node sees with the same content (emptyDir, hostPath, configMap ... do not count).
+SHARED_SOURCES = ("nfs", "persistent_volume_claim", "cephfs", "glusterfs", "csi", "flex_volume", "azure_file", "quobyte")
+
+
+def _is_shared(v: client.V1Volume) -> bool:
+    return any(getattr(v, a, None) is not None for a in SHARED_SOURCES)
+
+
+def _is_token(v: client.V1Volume) -> bool:
+    """The service-account token volume Kubernetes adds (jobs run without API access); other projected volumes stay."""
+    if v.name.startswith("kube-api-access"):
+        return True
+    sources = (v.projected.sources or []) if v.projected else []
+    return any(s.service_account_token for s in sources) and all(
+        s.service_account_token or s.downward_api or (s.config_map and s.config_map.name == "kube-root-ca.crt")
+        for s in sources)
+
+
 def _env_from_key(e: dict) -> tuple:
     ref = "configMapRef" if e.get("configMapRef") else "secretRef"
     return e.get("prefix"), ref, (e.get(ref) or {}).get("name")
@@ -140,28 +159,46 @@ def _toleration_key(t: dict) -> tuple:
     return t.get("key"), t.get("operator") or "Equal", t.get("value"), t.get("effect")
 
 
+def _own_container_refs(e: client.V1EnvVar, notebook_container: str) -> client.V1EnvVar:
+    """A resourceFieldRef naming the notebook container would point at a container the job does not have."""
+    ref = e.value_from and e.value_from.resource_field_ref
+    if ref is None or ref.container_name != notebook_container:
+        return e
+    e = copy.deepcopy(e)
+    e.value_from.resource_field_ref.container_name = None    # default: the container the variable is in
+    return e
+
+
 def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "") -> str:
     """Container command. Output goes to the pod log and to the log file. The script runs in its own process group
     and gets the SIGTERM sent at the -t limit or by kcancel, so it can save state within the grace period
     (bash as PID 1 would otherwise ignore SIGTERM and everything is killed 30 s later)."""
     q, ts = shlex.quote, "$(date -u +%FT%TZ)"
+    run = f" run {run_id}" if run_id else ""      # on every [kjob] line: runs sharing a log file stay apart
     return (
         "set -o pipefail\n"
-        f"mkdir -p {q(str(Path(log).parent))}\n"
-        f"cd {q(workdir)} || exit 1\n"
-        'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
         f"log={q(log)}\n"
-        f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel)\" | tee -a \"$log\"; "
+        # without a writable log the output would be lost while the job still reports success: stop before starting
+        f'if ! {{ mkdir -p {q(str(Path(log).parent))} && : >> "$log"; }} 2>/dev/null; then\n'
+        f'  echo "[kjob {ts}] cannot write the log file $log (missing directory, a file in the way, or no permission);'
+        ' the script was not started"; exit 1; fi\n'
+        f'cd {q(workdir)} || {{ echo "[kjob {ts}] cannot enter the working directory "{q(workdir)} | tee -a "$log"; exit 1; }}\n'
+        'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
+        f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel){run}\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
-        f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE{" run " + run_id if run_id else ""}"\n'
+        f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE{run}"\n'
         # background commands start with SIGINT ignored; restore it so KeyboardInterrupt works in the script
         f"  if command -v setsid >/dev/null 2>&1; then (trap - INT QUIT; exec setsid {command}) &\n"
         f"  else (trap - INT QUIT; exec {command}) & fi\n"
         '  echo $! > "$state.pid"; wait $!; rc=$?\n'
-        f'  echo "[kjob {ts}] exit code $rc"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" &\n'
+        f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" &\n'
         "tee_pid=$!\n"
-        "while kill -0 $tee_pid 2>/dev/null; do wait $tee_pid; done\n"
-        'exit "$(cat "$state.rc" 2>/dev/null || echo 1)"\n')
+        "while kill -0 $tee_pid 2>/dev/null; do wait $tee_pid; tee_rc=$?; done\n"
+        'rc=$(cat "$state.rc" 2>/dev/null || echo 1)\n'
+        'if [ "${tee_rc:-0}" -ne 0 ] && [ "${tee_rc:-0}" -lt 128 ]; then\n'
+        f'  echo "[kjob {ts}] warning: writing the log file $log failed part way (disk full or storage error);'
+        ' the pod log is complete, the file may not be"; fi\n'
+        'exit "$rc"\n')
 
 
 @dataclass
@@ -200,15 +237,17 @@ class NotebookTemplate:
         known = True
         try:
             for pd in client.CustomObjectsApi().list_namespaced_custom_object("kubeflow.org", "v1alpha1", ns, "poddefaults")["items"]:
-                selector = pd["spec"].get("selector", {})
+                selector = pd["spec"].get("selector") or {}
+                # every label any selector looks at goes to the job, so the job matches exactly the PodDefaults the
+                # notebook matches (a NotIn/DoesNotExist selector would otherwise start matching the job)
+                keys = set(selector.get("matchLabels") or {}) | {e["key"] for e in selector.get("matchExpressions") or []}
+                job_labels.update({k: labels[k] for k in keys if k in labels})
                 if not _matches(selector, labels):
                     continue
                 injected |= {v["name"] for v in pd["spec"].get("volumes", [])}
                 injected_env |= {e["name"] for e in pd["spec"].get("env", [])}
                 injected_env_from |= {_env_from_key(e) for e in pd["spec"].get("envFrom", [])}
                 injected_tol |= {_toleration_key(t) for t in pd["spec"].get("tolerations", [])}
-                keys = set(selector.get("matchLabels", {})) | {e["key"] for e in selector.get("matchExpressions", [])}
-                job_labels.update({k: labels[k] for k in keys if k in labels})
         except ApiException as e:
             if e.status not in (403, 404):
                 raise
@@ -226,7 +265,7 @@ class NotebookTemplate:
                                            if pod.spec.security_context else None),
                 job_labels=job_labels,
                 image_pull_secrets=pod.spec.image_pull_secrets or [],
-                env=[e for e in main.env or [] if e.name not in injected_env | KJOB_ENV
+                env=[_own_container_refs(e, main.name) for e in main.env or [] if e.name not in injected_env | KJOB_ENV
                      and not e.name.startswith("CUDA_MPS_")],
                 env_from=[e for e in main.env_from or []
                           if _env_from_key(api.sanitize_for_serialization(e)) not in injected_env_from],
@@ -243,13 +282,14 @@ class NotebookTemplate:
                 t.skipped[v.name] = "not mounted in the notebook container"
             elif v.name in injected:
                 t.skipped[v.name] = "added automatically by a PodDefault"
-                source = v.nfs or v.persistent_volume_claim
-                t.injected_mounts.append(client.V1VolumeMount(        # the job gets it again: still shared storage
-                    name=v.name, mount_path=m.mount_path,
-                    read_only=bool(m.read_only or (source is not None and source.read_only))))
+                if _is_shared(v):                                     # the job gets it again: still shared storage
+                    source = v.nfs or v.persistent_volume_claim
+                    t.injected_mounts.append(client.V1VolumeMount(
+                        name=v.name, mount_path=m.mount_path,
+                        read_only=bool(m.read_only or (source is not None and source.read_only))))
             elif known and v.name.startswith(MANAGED_VOLUME_PREFIXES):
                 t.skipped[v.name] = "outdated group/namespace share mount (restart the notebook to refresh it)"
-            elif v.projected is not None or v.name.startswith("kube-api-access"):
+            elif _is_token(v):
                 t.skipped[v.name] = "service-account token"
             elif v.persistent_volume_claim is not None and m.mount_path in nfs:
                 if m.sub_path or m.sub_path_expr:
@@ -269,8 +309,8 @@ class NotebookTemplate:
         return t
 
     def shared_paths(self) -> list[str]:
-        """Mount points shared with jobs (emptyDir volumes are per pod)."""
-        names = {v.name for v in self.volumes if v.empty_dir is None}
+        """Mount points whose content the job sees too: network storage (emptyDir and hostPath are per pod/node)."""
+        names = {v.name for v in self.volumes if _is_shared(v)}
         return [m.mount_path for m in self.volume_mounts if m.name in names] + [m.mount_path for m in self.injected_mounts]
 
 
@@ -282,7 +322,7 @@ class JobSpec:
     gpus: int = 1
     cpus: int = DEFAULT_CPUS
     memory: str = DEFAULT_MEMORY
-    shm: str = DEFAULT_SHM
+    shm: str | None = DEFAULT_SHM                     # None: same as memory
     gpu_types: list[str] = field(default_factory=list)   # e.g. ["a5000", "v100"]
     node: str | None = None                              # pin to one host
     exclude_nodes: list[str] = field(default_factory=list)
@@ -302,7 +342,7 @@ class JobSpec:
             raise ValueError("TTL must be a nonnegative integer.")
         if self.time_limit is not None and (not isinstance(self.time_limit, int) or self.time_limit < 1):
             raise ValueError("Time limit must be a positive number of seconds.")
-        for key, value in (("memory", self.memory), ("shared memory", self.shm)):
+        for key, value in (("memory", self.memory), ("shared memory", self.shm or self.memory)):
             try:
                 amount = parse_quantity(value)
                 if not amount.is_finite() or amount <= 0:
@@ -352,7 +392,7 @@ class KJob:
         spec.validate()
         self.spec = spec
         self.spec.name = sanitize_name(spec.name)
-        self.t = template or NotebookTemplate.from_current_pod(spec.shm)
+        self.t = template or NotebookTemplate.from_current_pod(spec.shm or spec.memory)
         self.ns = self.t.namespace
         self.core = client.CoreV1Api()
         self.custom = client.CustomObjectsApi()
@@ -369,7 +409,8 @@ class KJob:
         res = {"cpu": str(s.cpus), "memory": s.memory}
         if s.gpus:
             res["nvidia.com/gpu"] = str(s.gpus)  # CPU-only jobs must not request GPUs at all
-        env = [e for e in t.env if e.name not in s.env]          # the notebook's own env; --env wins
+        # the notebook's own env; --env replaces a value in place, so later $(VAR) references still expand
+        env = [client.V1EnvVar(name=e.name, value=s.env[e.name]) if e.name in s.env else e for e in t.env]
         env += [client.V1EnvVar(name="PYTHONUNBUFFERED", value="1"),
                client.V1EnvVar(name="KJOB_NAME", value=s.name),
                client.V1EnvVar(name="KJOB_NODE", value_from=client.V1EnvVarSource(
@@ -377,24 +418,27 @@ class KJob:
         if not s.gpus:  # CUDA images may default NVIDIA_VISIBLE_DEVICES=all, exposing the node's GPUs without a request
             hide = {"NVIDIA_VISIBLE_DEVICES": "void", "CUDA_VISIBLE_DEVICES": "-1"}
             env += [client.V1EnvVar(name=k, value=v) for k, v in hide.items()]
-        env += [client.V1EnvVar(name=k, value=v) for k, v in s.env.items()]
+        inherited = {e.name for e in t.env}
+        env += [client.V1EnvVar(name=k, value=v) for k, v in s.env.items() if k not in inherited]
         products = [GPU_PRODUCTS.get(g, g) for g in s.gpu_types]
         mps = bool(s.gpus) and any(p.endswith("-SHARED") for p in products)
         if mps and t.effective_uid != 0:
             raise ValueError("This installation only enables shared MPS jobs for UID 0 Notebooks; the administrator must also verify the server UID and health. Use a whole GPU type for a non-root Notebook.")
-        volumes, volume_mounts = t.volumes, t.volume_mounts
-        if mps:  # the device plugin provides /dev/shm
-            shm = {m.name for m in t.volume_mounts if m.mount_path == "/dev/shm"}
-            volumes = [v for v in t.volumes if v.name not in shm]
-            volume_mounts = [m for m in t.volume_mounts if m.name not in shm]
+        shm = {m.name for m in t.volume_mounts if m.mount_path == "/dev/shm"}
+        volumes = [v for v in t.volumes if v.name not in shm]
+        volume_mounts = [m for m in t.volume_mounts if m.name not in shm]
+        if not mps:  # --shm sizes /dev/shm whether or not the notebook has one (the device plugin provides it for MPS)
+            name = next(iter(shm), "kjob-shm")
+            volumes.append(client.V1Volume(name=name, empty_dir=client.V1EmptyDirVolumeSource(medium="Memory", size_limit=s.shm or s.memory)))
+            volume_mounts.append(client.V1VolumeMount(name=name, mount_path="/dev/shm"))
         container = client.V1Container(
             name="pytorch", image=t.image, command=["bash", "-lc", shell], working_dir=workdir, env=env,
             env_from=t.env_from or None,
             security_context=t.container_security_context,
             resources=client.V1ResourceRequirements(requests=res, limits=res), volume_mounts=volume_mounts)
-        terms = []
+        terms, fields = [], []      # nodes are pinned by metadata.name: the hostname label may differ from it
         if s.node:
-            terms.append(client.V1NodeSelectorRequirement(key="kubernetes.io/hostname", operator="In", values=[s.node]))
+            fields.append(client.V1NodeSelectorRequirement(key="metadata.name", operator="In", values=[s.node]))
         if s.gpu_types:
             terms.append(client.V1NodeSelectorRequirement(key="nvidia.com/gpu.product", operator="In", values=products))
         if s.gpus and not mps:
@@ -402,10 +446,11 @@ class KJob:
         elif mps:
             terms.append(client.V1NodeSelectorRequirement(key=SHARING_STRATEGY_LABEL, operator="In", values=["mps"]))
         if s.exclude_nodes:
-            terms.append(client.V1NodeSelectorRequirement(key="kubernetes.io/hostname", operator="NotIn", values=s.exclude_nodes))
+            fields.append(client.V1NodeSelectorRequirement(key="metadata.name", operator="NotIn", values=s.exclude_nodes))
         affinity = client.V1Affinity(node_affinity=client.V1NodeAffinity(
             required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
-                node_selector_terms=[client.V1NodeSelectorTerm(match_expressions=terms)]))) if terms else None
+                node_selector_terms=[client.V1NodeSelectorTerm(match_expressions=terms or None, match_fields=fields or None)]))) \
+            if terms or fields else None
         pod_spec = client.V1PodSpec(containers=[container], volumes=volumes, affinity=affinity,
                                     security_context=t.security_context, image_pull_secrets=t.image_pull_secrets or None,
                                     runtime_class_name=t.runtime_class_name, tolerations=t.tolerations or None,
@@ -572,7 +617,8 @@ class KJob:
     def stream_logs(self) -> Iterator[str]:
         """Yield log lines in real time until the container exits."""
         self._pod()
-        resp = self.core.read_namespaced_pod_log(self.pod_name, self.ns, follow=True, _preload_content=False)
+        resp = self.core.read_namespaced_pod_log(self.pod_name, self.ns, container="pytorch", follow=True,
+                                                 _preload_content=False)
         buf = b""
         try:
             for chunk in resp.stream(1024):
@@ -646,8 +692,8 @@ class KJob:
             if e.status == 404:
                 return None
             raise
-        for cs in pod.status.container_statuses or []:
-            if cs.state.terminated is not None:
+        for cs in pod.status.container_statuses or []:     # only the job's own container: a sidecar's 0 is not ours
+            if cs.name == "pytorch" and cs.state.terminated is not None:
                 self.exit_reason = cs.state.terminated.reason  # e.g. OOMKilled, Error, Completed
                 return cs.state.terminated.exit_code
         return None
@@ -665,7 +711,7 @@ class KJob:
             try:
                 report(f"kjob: {self.spec.name} running on {self._pod().spec.node_name}")
                 for line in self.stream_logs():
-                    m = re.match(r"\[kjob [^\]]*\] exit code (\d+)$", line)
+                    m = re.match(r"\[kjob [^\]]*\] exit code (\d+)( run [0-9a-f]+)?$", line)
                     if m:
                         last_code = int(m.group(1))
                     else:
@@ -681,6 +727,10 @@ class KJob:
         code = self.exit_code()
         code = code if code is not None else last_code
         reason = self.stop_reason() or getattr(self, "exit_reason", None)
+        if reason == "DeadlineExceeded":       # stopped at -t: not a success even if the script saved and exited 0
+            report(f"kjob: {self.spec.name} stopped at the time limit (-t); the script exited with {code} after SIGTERM. "
+                   f"Exit status 124")
+            return code if code not in (None, 0) else 124
         detail = f", {reason}" if reason and reason not in ("Completed", "Error") else ""
         report(f"kjob: {self.spec.name} {st} (exit code {code}{detail})")
         return code if code is not None else (0 if st == "Succeeded" else 1)
@@ -720,7 +770,7 @@ def record_history(job: "KJob") -> None:
         pass
 
 
-def read_history() -> list[dict]:
+def _history_lines() -> list[dict]:
     try:
         lines = HISTORY_FILE.read_text().splitlines()
     except OSError:
@@ -734,6 +784,26 @@ def read_history() -> list[dict]:
     return out
 
 
+def read_history() -> list[dict]:
+    """Submission records (oldest first)."""
+    return [r for r in _history_lines() if "event" not in r]
+
+
+def read_events() -> list[dict]:
+    """Other records, e.g. {"event": "cancel", "name": ..., "time": ...} written by kcancel."""
+    return [r for r in _history_lines() if "event" in r]
+
+
+def record_event(event: str, name: str) -> None:
+    rec = {"event": event, "name": name, "time": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with HISTORY_FILE.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
 def log_runs(path: str) -> list[dict]:
     """Runs recorded in a job log by the wrapper's [kjob ...] lines: start, end, exit code, stopped (SIGTERM), and the
     submission's run id (None in logs written before kjob printed it)."""
@@ -744,13 +814,20 @@ def log_runs(path: str) -> list[dict]:
                 m = re.match(r"\[kjob (\S+)\] (start|exit code (\d+)|stopping)(?:.* run ([0-9a-f]+)\s*$)?", line)
                 if not m:
                     continue
-                if m.group(2) == "start" or not runs:
-                    runs.append({"start": m.group(1) if m.group(2) == "start" else None, "end": None, "code": None,
-                                 "stopped": False, "id": m.group(4) if m.group(2) == "start" else None})
+                rid = m.group(4)
+                if m.group(2) == "start":
+                    runs.append({"start": m.group(1), "end": None, "code": None, "stopped": False, "id": rid})
+                    continue
+                # exit/stopping lines name their run (older logs do not: then it is the latest run)
+                run = next((r for r in reversed(runs) if r["id"] == rid), None) if rid else None
+                if run is None:
+                    if not runs:
+                        runs.append({"start": None, "end": None, "code": None, "stopped": False, "id": rid})
+                    run = runs[-1]
                 if m.group(2) == "stopping":
-                    runs[-1]["stopped"], runs[-1]["end"] = True, m.group(1)
+                    run["stopped"], run["end"] = True, m.group(1)
                 elif m.group(3):
-                    runs[-1]["end"], runs[-1]["code"] = m.group(1), int(m.group(3))
+                    run["end"], run["code"] = m.group(1), int(m.group(3))
     except OSError:
         pass
     return runs

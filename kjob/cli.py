@@ -166,7 +166,7 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("-G", "--gpus", type=int, default=1, help="GPUs (default 1; 0 for CPU-only)")
     p.add_argument("-c", "--cpus", type=int, default=core.DEFAULT_CPUS, help="CPU cores (default 1)")
     p.add_argument("--mem", default=core.DEFAULT_MEMORY, help="memory, e.g. 32Gi (default 2Gi)")
-    p.add_argument("--shm", default=core.DEFAULT_SHM, help="/dev/shm size, e.g. 8Gi (default 256Mi)")
+    p.add_argument("--shm", default=core.DEFAULT_SHM, help="/dev/shm size limit, e.g. 8Gi (default: same as --mem)")
     p.add_argument("-g", "--gpu-type", default="", help=f"comma list of GPU types: {', '.join(core.GPU_PRODUCTS)}, a "
                    "name shown by ksinfo, or a raw nvidia.com/gpu.product value")
     p.add_argument("-w", "--nodelist", default=None, help="run on this node (kubernetes.io/hostname)")
@@ -216,8 +216,13 @@ def resolve_gpu_types(values: list[str], node: str | None, snapshot=None) -> tup
             raise ValueError(f"Unknown GPU type {v!r}: use a short name ({', '.join(core.GPU_PRODUCTS)}), a full "
                              "nvidia.com/gpu.product value, or -w NODE (the cluster GPU list is not available "
                              "to check other names).")
+        stale = _stale(snap)
         if alias:
             if not any(n["product"] == core.GPU_PRODUCTS[alias] for n in nodes):
+                if stale:                           # old data may predate the node: let the scheduler decide
+                    _warn_stale(snap, v)
+                    out.append(alias)
+                    continue
                 raise ValueError(f"GPU type {v!r} ({core.GPU_PRODUCTS[alias]}) is not in this cluster; see ksinfo.")
             out.append(alias)
             continue
@@ -236,8 +241,14 @@ def resolve_gpu_types(values: list[str], node: str | None, snapshot=None) -> tup
             node = host[0]["name"]
             continue
         hits = exact or partial
+        if not hits and stale and label_like:
+            _warn_stale(snap, v)
+            out.append(v)
+            continue
         if not hits:
-            raise ValueError(f"GPU type {v!r} matches nothing in this cluster; see ksinfo for the names.")
+            raise ValueError(f"GPU type {v!r} matches nothing in this cluster; see ksinfo for the names."
+                             + (f" (The cluster data is {_dur(cluster.snapshot_age(snap))} old; a full "
+                                "nvidia.com/gpu.product value is accepted anyway.)" if stale else ""))
         if len(hits) > 1:
             raise ValueError(f"GPU type {v!r} matches several types ({', '.join(sorted(hits))}); be more specific "
                              "or list the ones you want with commas.")
@@ -274,16 +285,19 @@ def _check_access(gpu_types: list[str], node: str | None, exclude: list[str], gp
     if not gpus:
         return
     try:
-        nodes = cluster.load_snapshot().get("nodes", [])
+        snap = cluster.load_snapshot()
     except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
         return
+    if _stale(snap):
+        return                                  # old data must not block a job; the scheduler will decide
+    nodes = snap.get("nodes", [])
     wanted = {core.GPU_PRODUCTS.get(g, g) for g in gpu_types}
     candidates = [n for n in nodes if n["name"] not in exclude and (not node or n["name"] == node)
                   and (n["product"] in wanted if wanted else node or n.get("sharing") != "mps")]
     if not candidates or not all(n["restricted"] for n in candidates):
         return
     tol = _my_tolerations()
-    if tol is None or any(all(_tolerated(x, tol) for x in n["restricted"]) for n in candidates):
+    if tol is None or any(all(_tolerated(x, tol) for x in _taints(n)) for n in candidates):
         return
     where = ", ".join(f"{n['name']} ({cluster.node_type(n)}, {', '.join(n['restricted'])})" for n in candidates)
     raise ValueError(f"Namespace {core.current_namespace()} has no access to the requested GPUs on {where}, so the job "
@@ -536,7 +550,7 @@ def cmd_logs(a) -> int:
             if pod.status.phase == "Pending":
                 report(f"kjob: {a.name} has not started yet (Pending); kshow {a.name} shows why, klogs -f waits")
                 return 0
-            print(j.core.read_namespaced_pod_log(j.pod_name, j.ns), end="")
+            print(j.core.read_namespaced_pod_log(j.pod_name, j.ns, container="pytorch"), end="")
         return 0
     except KeyboardInterrupt:
         return 130
@@ -567,6 +581,10 @@ def cmd_cancel(a) -> int:
         raise ValueError("give job names, --finished or --all-mine")
     a.names = [_job_name(n) for n in a.names]
     targets = {n: None for n in a.names}
+    try:                                        # jobs not finished yet: deleting them is a cancellation
+        running = {o["metadata"]["name"] for o in core.list_jobs() if core.job_state(o) not in core.TERMINAL}
+    except (ApiException, HTTPError):
+        running = set()
     if a.finished or a.all_mine:
         notebook = None if a.all_notebooks else core.current_notebook()
         for o in core.list_jobs(notebook=notebook):
@@ -576,6 +594,8 @@ def cmd_cancel(a) -> int:
     for n, uid in targets.items():
         deleted = core.delete_job(ns, n, uid=uid)
         print(f"{'deleted' if deleted else 'not found or replaced'}: {n}")
+        if deleted and n in running:
+            core.record_event("cancel", n)      # kacct shows CANCELLED even when the log never got an end line
         missing += not deleted and n in a.names
     return 1 if missing else 0
 
@@ -586,6 +606,7 @@ def _ts(x: str) -> dt.datetime:
 
 def cmd_acct(a) -> int:
     hist = core.read_history()
+    cancels = core.read_events()
     try:
         live = {o["metadata"]["name"]: core.job_state(o) for o in core.list_jobs()}
     except (ApiException, HTTPError, ConfigException):
@@ -607,16 +628,19 @@ def cmd_acct(a) -> int:
                 continue
             if not run["start"]:
                 continue
-            # older logs: a run belongs to the latest submission made before it started
-            start = _ts(run["start"]) + dt.timedelta(seconds=60)      # allow some clock skew between nodes
-            before = [x for x in legacy if _ts(x["submitted"]) <= start]
+            # older logs: a run belongs to the latest submission made before it started; only if there is none,
+            # allow a minute of clock skew between the notebook and the node
+            start = _ts(run["start"])
+            before = [x for x in legacy if _ts(x["submitted"]) <= start] or \
+                [x for x in legacy if _ts(x["submitted"]) <= start + dt.timedelta(seconds=60)]
             if before:
                 run_of[id(before[-1])] = run
     rows = []
-    for r in hist:
+    for i, r in enumerate(hist):
         log = r.get("log", "")
         run = run_of.get(id(r))
         last = r is by_log[log][-1]
+        nxt = next((x for x in hist[i + 1:] if x["name"] == r["name"]), None)   # the same name submitted again
         code = run and run["code"]
         if run and run["stopped"]:
             state = "STOPPED"      # time limit or kcancel
@@ -624,6 +648,9 @@ def cmd_acct(a) -> int:
             state = "COMPLETED" if code == 0 else "FAILED"
         elif last and r["name"] in live:
             state = {"Created": "PENDING"}.get(live[r["name"]], live[r["name"]].upper())
+        elif any(e["event"] == "cancel" and e["name"] == r["name"] and _ts(e["time"]) >= _ts(r["submitted"])
+                 and (nxt is None or _ts(e["time"]) < _ts(nxt["submitted"])) for e in cancels):
+            state = "CANCELLED"    # kcancel before it finished (the log may have no end line)
         else:
             state = "ENDED?"       # deleted before it finished, or never started
         elapsed = None
@@ -660,14 +687,39 @@ def _my_tolerations() -> list | None:
                   for t in pd["spec"].get("tolerations", [])]
 
 
+TAINT_EFFECTS = ("NoSchedule", "PreferNoSchedule", "NoExecute")
+
+
 def _tolerated(taint: str, tolerations: list) -> bool:
-    key, _, value = taint.partition("=")
+    """taint is "key=value:Effect" (older status data: "key=value", effect unknown and not compared)."""
+    head, _, effect = taint.rpartition(":")
+    if effect not in TAINT_EFFECTS:
+        head, effect = taint, None
+    key, _, value = head.partition("=")
     for t in tolerations:
+        if effect and t.get("effect") and t.get("effect") != effect:
+            continue                           # a NoExecute toleration does not cover a NoSchedule taint
         if t.get("operator") == "Exists" and not t.get("key"):
             return True                        # tolerates every taint
-        if t.get("key") == key and (t.get("operator") == "Exists" or t.get("value", "") == value):
+        if t.get("key") == key and (t.get("operator") == "Exists" or (t.get("value") or "") == value):
             return True
     return False
+
+
+def _taints(n: dict) -> list[str]:
+    """A node's restricting taints with their effect when the status data has them (newer collectors)."""
+    if n.get("taints") is not None:
+        return [f"{t['key']}={t['value']}:{t['effect']}" if t.get("value") else f"{t['key']}:{t['effect']}" for t in n["taints"]]
+    return n.get("restricted", [])
+
+
+def _stale(snap: dict) -> bool:
+    return bool(snap) and snap.get("source") != "live" and cluster.snapshot_age(snap) > 600
+
+
+def _warn_stale(snap: dict, value: str) -> None:
+    print(f"kjob: warning: {value!r} is not in the cluster data, which is {_dur(cluster.snapshot_age(snap))} old "
+          "(the status service may be down); submitting anyway, check kshow if it stays pending.", file=sys.stderr)
 
 
 def cmd_sinfo(a) -> int:
@@ -694,7 +746,7 @@ def _sinfo(a) -> None:
         t["used"] += n["gpus_used"]
         if n["ready"] and n["schedulable"]:
             t["free"] += max(n["gpus"] - n["gpus_used"], 0)
-        t["restricted"] |= set(n["restricted"])
+        t["restricted"] |= set(_taints(n))
     for w in snap.get("workloads", []):
         if w["state"] == "Pending" and w["gpus"]:
             for tname in cluster.workload_type(w, by_name).split(","):
@@ -791,17 +843,17 @@ def link_claude_skills(home: Path, claude: Path) -> list[Path]:
         name = src.parent.name
         target, link = home / name, claude / name
         if link.is_symlink():
-            if Path(os.readlink(link)) == target:
-                continue
-            link.unlink()
+            continue                           # ours already, or the user's own link: leave it
         elif link.exists():
-            copy = link / "SKILL.md"
+            # only a copy an older kjob made: exactly SKILL.md and its marker, SKILL.md unedited. Anything else in
+            # the directory (or no marker at all) means it is not ours to delete.
             try:
                 recorded = (link / SKILL_MARKER).read_text().strip()
+                entries = {p.name for p in link.iterdir()}
             except OSError:
-                recorded = None
-            if _sha(copy) != recorded:
-                continue                       # not ours, or edited by the user: keep it
+                continue
+            if not recorded or _sha(link / "SKILL.md") != recorded or entries != {"SKILL.md", SKILL_MARKER}:
+                continue
             shutil.rmtree(link)
         claude.mkdir(parents=True, exist_ok=True)
         link.symlink_to(target, target_is_directory=True)
@@ -828,6 +880,13 @@ def auto_install_skills() -> None:
     if changed:
         print("kjob: installed AI skills (kjob-install, kjob-jobs) in ~/.agents/skills, linked from ~/.claude/skills; "
               "set KJOB_NO_SKILLS=1 to turn this off", file=sys.stderr)
+        home, claude = Path.home() / SKILLS_HOME[2:], Path.home() / CLAUDE_SKILLS[2:]
+        kept = [src.parent.name for src in sorted(SKILLS_DIR.glob("*/SKILL.md"))
+                if (claude / src.parent.name).exists() and not ((claude / src.parent.name).is_symlink()
+                    and Path(os.readlink(claude / src.parent.name)) == home / src.parent.name)]
+        if kept:
+            print(f"kjob: kept your own ~/.claude/skills/{{{','.join(kept)}}} (not replaced; Claude Code reads those)",
+                  file=sys.stderr)
 
 
 def cmd_install_skills(a) -> int:
@@ -972,6 +1031,12 @@ def _api_error(e: ApiException) -> str:
     out = f"kjob: Kubernetes API error ({e.status} {e.reason}): {msg or e.reason}"
     if e.status == 403 and "exceeded quota" in msg:
         return out + "\n  The namespace quota is used up: see kinfo, wait for your other jobs, or request less."
+    if "admission webhook" in msg or "denied the request" in msg:
+        return out + ("\n  An admission rule of the cluster rejected the request (not a missing permission). The message "
+                      "above says which one; ask the cluster administrator if it is unclear.")
+    if e.status == 403 and not re.search(r"cannot \w+ resource", msg):
+        return out + ("\n  The cluster refused the request for the reason above (a policy or admission rule, not a "
+                      "missing permission of this account).")
     if e.status == 403:
         return out + ("\n  kjob acts as the Notebook's service account. Notebooks created in the Kubeflow UI run as "
                       "default-editor, which has every permission kjob needs.\n  If the account above is not "
