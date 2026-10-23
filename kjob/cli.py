@@ -406,8 +406,9 @@ def cmd_wait(a) -> int:
         report("kjob: stopped following (job keeps running)")
         return 130
     finally:
-        if not a.keep and (j.state() in core.TERMINAL or getattr(j, "invalid", False)):
-            j.delete()
+        if not a.keep and (j.state() in core.TERMINAL or getattr(j, "invalid", False)
+                           or getattr(j, "main_finished", False)):
+            j.cleanup_finished(report)
 
 
 def _queue_rows(everyone: bool):
@@ -607,6 +608,7 @@ def _ts(x: str) -> dt.datetime:
 def cmd_acct(a) -> int:
     hist = core.read_history()
     cancels = core.read_events()
+    log_errors = {e["run_id"]: e for e in cancels if e.get("event") == "log-error" and e.get("run_id")}
     try:
         live = {o["metadata"]["name"]: core.job_state(o) for o in core.list_jobs()}
     except (ApiException, HTTPError, ConfigException):
@@ -642,7 +644,10 @@ def cmd_acct(a) -> int:
         last = r is by_log[log][-1]
         nxt = next((x for x in hist[i + 1:] if x["name"] == r["name"]), None)   # the same name submitted again
         code = run and run["code"]
-        if run and run["stopped"]:
+        if r.get("run_id") in log_errors:
+            state = "LOG_ERROR"
+            code = log_errors[r["run_id"]].get("exit_code", code)
+        elif run and run["stopped"]:
             state = "STOPPED"      # time limit or kcancel
         elif code is not None:
             state = "COMPLETED" if code == 0 else "FAILED"

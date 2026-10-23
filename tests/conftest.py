@@ -15,3 +15,13 @@ def _private_history(monkeypatch):
     with tempfile.TemporaryDirectory() as d:
         monkeypatch.setattr(core, "HISTORY_FILE", Path(d) / "history.jsonl")
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_kubernetes_requests(monkeypatch):
+    from kubernetes import client
+
+    def reject(*args, **kwargs):
+        raise AssertionError("Offline tests must mock every Kubernetes API call")
+
+    monkeypatch.setattr(client.ApiClient, "call_api", reject)

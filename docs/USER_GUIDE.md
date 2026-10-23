@@ -35,6 +35,7 @@
 * namespace 的 **PodDefault**（例如共用 NFS、受限 GPU 節點的 toleration）也會套用到工作。
 * 工作的輸出用 `tee` 同時寫到 Pod log 和 `~/kjob-logs/NAME.log`。
 * 工作結束後 Pod 保留供查看，工作物件在 `--ttl` 秒後自動刪除；`ksrun`、`kwait` 會在結束時直接刪除。
+  例外：日誌保存失敗會保留已結束的工作與 Pod，供取回輸出（`--ttl` 仍適用）；未能確認完成的監看錯誤也不會取消工作。
 
 ## 安裝與更新
 
@@ -97,6 +98,10 @@ worker），所以主程式可能先看到 worker 結束的錯誤；存檔的 ha
 
 * 排隊時顯示排程訊息（例如 GPU 不足），開始後即時輸出，結束時印出 `Succeeded/Failed (exit code N)`。
 * 結束代碼就是程式的結束代碼，可用在 shell 腳本：`ksrun ... && echo ok`。
+  若程式成功但日誌寫入失敗，回傳 74；程式本身已非零退出時保留原代碼。`kacct` 會以該次 run_id 記為 `LOG_ERROR`。
+* 主容器已退出時會依其結果完成，不必等 training operator 更新狀態。log stream 已結束卻仍無法確認完成時，
+  最多再等 30 秒後回傳錯誤並保留工作，使用 `kwait NAME` 重新連線。這不是排隊或整個訓練的時間上限，也不是所有 API 呼叫的網路 timeout。
+* 不換行的長輸出會分段即時顯示，避免在 Notebook 累積整份輸出；保存的 log 檔內容不受影響。
 * Ctrl-C 會**取消**工作。連線中斷時工作不受影響，之後用 `kqueue`、`kwait` 查看。
 
 ## 腳本內設定：#SBATCH / #KJOB
@@ -284,6 +289,8 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 | `ModuleNotFoundError` | 套件只裝在 Notebook 系統目錄；改用 `pip install --user` 或 `/home/jovyan` 上的虛擬環境 + `--python` |
 | `stopped at the time limit`、`DeadlineExceeded`（ksrun／kwait／kshow 顯示） | 超過 `-t` 時間上限；程式有收到 SIGTERM，可在 handler 存 checkpoint 後續跑。即使程式存完檔正常結束，`ksrun`／`kwait` 也回傳 124，不當成成功 |
 | `cannot write the log file ...; the script was not started` | 日誌目錄不存在、被同名檔案擋住或沒有寫入權限，程式沒有執行。檢查 `-o` 指定的目錄（預設 `~/kjob-logs`） |
+| `log write failed`、`LOG_ERROR` | 日誌未完整存入共用磁碟。`ksrun`／`kwait` 不會自動刪除已結束的 Pod；請在 `--ttl` 到期前用 `klogs NAME > /另一個可寫的共用磁碟/NAME.log` 取回，確認內容後才 `kcancel NAME`。取回前不要執行 `kclean`；清理命令與 operator 的 TTL 仍能刪除 Pod。 |
+| `log stream ended but completion could not be confirmed` | 監看結束但沒有可靠終態，工作沒有被取消。用 `kshow NAME` 看狀態或 `kwait NAME` 重新接上。 |
 | `cuda: False` | 用了 `-G 0`，或 image／環境沒有 CUDA 版 PyTorch |
 | `kjob: Kubernetes API error (403 Forbidden): ... cannot create resource "pytorchjobs" ...` | Notebook 的帳號沒有這個權限。訊息裡會寫是哪個帳號、缺什麼。Kubeflow 介面建立的 Notebook 用 `default-editor`，權限是齊的；不是的話重新從介面建 Notebook，否則請管理員處理（[ADMIN.md](ADMIN.md) 有權限清單） |
 | `kjob: Kubernetes API error (403 Forbidden): exceeded quota` | namespace 配額用完（Notebook 也算在內）：看 `kinfo`，等其他工作結束或少要一點 |

@@ -313,7 +313,8 @@ class CliBehaviourTest(unittest.TestCase):
         with mock.patch.object(core, "current_namespace", return_value="ns"):
             with self.assertRaises(ValueError):
                 cli.cmd_cancel(argparse.Namespace(names=[], finished=False, all_mine=False, all_notebooks=False))
-            with mock.patch.object(core, "delete_job", return_value=False), mock.patch("sys.stdout", io.StringIO()):
+            with mock.patch.object(core, "delete_job", return_value=False), \
+                    mock.patch.object(core, "list_jobs", return_value=[]), mock.patch("sys.stdout", io.StringIO()):
                 self.assertEqual(cli.cmd_cancel(argparse.Namespace(names=["x"], finished=False, all_mine=False,
                                                                    all_notebooks=False)), 1)
 
