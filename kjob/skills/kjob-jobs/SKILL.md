@@ -138,12 +138,9 @@ kqueue -u mxxxxxxx        # one user's (namespace's) workloads
 * `CUDA out of memory`: smaller batch, or a GPU type with more memory.
 * `No such file or directory`: script or data not on a shared volume, or a relative path; use absolute paths.
 * `ModuleNotFoundError`: package installed somewhere the job cannot see; see step 2.
-* `log write failed` / `LOG_ERROR`: the shared log is incomplete. `ksrun` and `kwait` retain the finished Pod;
-  recover it with `klogs NAME > /another/writable/shared/path/NAME.log` before the configured `--ttl` expires.
-  Verify the recovered output before `kcancel NAME`; do not run `kclean` first, as it also deletes these Pods.
-  A successful script with failed log storage returns 74; a script's existing nonzero code is preserved.
-* `log stream ended but completion could not be confirmed`: monitoring failed, the job was not cancelled.
-  Inspect `kshow NAME` and reconnect with `kwait NAME`.
+* `log write failed` / `LOG_ERROR`: the Pod is retained. Save `klogs NAME` to writable shared storage before
+  `--ttl`, `kcancel`, or `kclean` removes it. Exit 74 means log storage failed; existing script errors keep their code.
+* `log stream ended but completion could not be confirmed`: the job is retained. Check `kshow NAME`, then retry `kwait NAME`.
 * Stopped at the time limit: "stopped at the time limit" / `DeadlineExceeded` (ksrun/kwait/kshow; they exit with 124 even if the
   script saved and exited 0), `STOPPED` in kacct (`CANCELLED`: deleted by kcancel before it could log an end). Training code should handle
   SIGTERM (save a checkpoint) since it gets 30 s before being killed; resubmit with a larger `-t` and
