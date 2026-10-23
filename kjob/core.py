@@ -482,6 +482,7 @@ class KJob:
             "metadata": {"name": s.name, "namespace": self.ns,
                          "labels": {"app.kubernetes.io/managed-by": MANAGED_BY, "kjob/notebook": t.pod_name},
                          "annotations": {"kjob/command": s.command()[:2000], "kjob/log": log,
+                                         "kjob/run-id": self.run_id,
                                          "kjob/workdir": workdir,
                                          "kjob/submitted": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}},
             "spec": {
@@ -730,6 +731,8 @@ class KJob:
     def follow(self, out=sys.stdout, report=None) -> int:
         """Wait for the pod, stream its output, wait for the job to end; return the script's exit code."""
         report = report or (lambda m: print(m, file=sys.stderr, flush=True))
+        self.monitor_incomplete = False
+        self.main_finished = False
         last_code = None
         phase = self.wait_for_pod(report=report)
         if phase == "Invalid":

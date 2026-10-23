@@ -99,6 +99,8 @@ worker），所以主程式可能先看到 worker 結束的錯誤；存檔的 ha
 * 排隊時顯示排程訊息（例如 GPU 不足），開始後即時輸出，結束時印出 `Succeeded/Failed (exit code N)`。
 * 結束代碼就是程式的結束代碼，可用在 shell 腳本：`ksrun ... && echo ok`。
   若程式成功但日誌寫入失敗，回傳 74；程式本身已非零退出時保留原代碼。`kacct` 會以該次 run_id 記為 `LOG_ERROR`。
+  背景工作的 `kacct` 也會核對相同 run_id／UID 的 Pod 結果，不會只憑 log 的成功結尾判定；查詢失敗時顯示 `UNCONFIRMED`。
+  無法連到叢集時仍可離線讀歷史，但只能根據已保存的紀錄推算，不能補驗已遺失的輸出。
 * 主容器已退出時會依其結果完成，不必等 training operator 更新狀態。log stream 已結束卻仍無法確認完成時，
   最多再等 30 秒後回傳錯誤並保留工作，使用 `kwait NAME` 重新連線。這不是排隊或整個訓練的時間上限，也不是所有 API 呼叫的網路 timeout。
 * 不換行的長輸出會分段即時顯示，避免在 Notebook 累積整份輸出；保存的 log 檔內容不受影響。

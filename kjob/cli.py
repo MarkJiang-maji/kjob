@@ -610,9 +610,10 @@ def cmd_acct(a) -> int:
     cancels = core.read_events()
     log_errors = {e["run_id"]: e for e in cancels if e.get("event") == "log-error" and e.get("run_id")}
     try:
-        live = {o["metadata"]["name"]: core.job_state(o) for o in core.list_jobs()}
+        live_jobs = {o["metadata"]["name"]: o for o in core.list_jobs()}
     except (ApiException, HTTPError, ConfigException):
-        live = {}              # history still works without cluster access
+        live_jobs = {}              # history still works without cluster access
+    live = {name: core.job_state(o) for name, o in live_jobs.items()}
     by_log = {}
     for r in hist:
         by_log.setdefault(r.get("log", ""), []).append(r)
@@ -644,9 +645,32 @@ def cmd_acct(a) -> int:
         last = r is by_log[log][-1]
         nxt = next((x for x in hist[i + 1:] if x["name"] == r["name"]), None)   # the same name submitted again
         code = run and run["code"]
+        actual = None
+        obj = live_jobs.get(r["name"])
+        # New jobs identify their run on the CR as well as in the log. Do not trust a log's exit line until
+        # the wrapper (including tee) has finished; ksub users may never have called kwait to record an error.
+        if (obj and r.get("run_id") and r["run_id"] == (obj["metadata"].get("annotations") or {}).get("kjob/run-id")):
+            try:
+                j = _job_for(r["name"])
+                j.uid, j.run_id = obj["metadata"]["uid"], r["run_id"]
+                pod_code = j.exit_code()
+                if getattr(j, "log_failed", False):
+                    actual = ("LOG_ERROR", pod_code)
+                elif pod_code is not None:
+                    actual = ("COMPLETED" if pod_code == 0 else "FAILED", pod_code)
+                else:
+                    status = live[r["name"]]
+                    state = "UNCONFIRMED" if status in core.TERMINAL else {"Created": "PENDING"}.get(status, status.upper())
+                    actual = (state, None)
+            except (ApiException, HTTPError, ConfigException):
+                actual = ("UNCONFIRMED", None)
         if r.get("run_id") in log_errors:
             state = "LOG_ERROR"
             code = log_errors[r["run_id"]].get("exit_code", code)
+        elif actual is not None:
+            state, code = actual
+            if run and run["stopped"] and state != "LOG_ERROR":
+                state = "STOPPED"
         elif run and run["stopped"]:
             state = "STOPPED"      # time limit or kcancel
         elif code is not None:

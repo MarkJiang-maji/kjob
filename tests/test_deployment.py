@@ -126,6 +126,18 @@ class MonitoringTests(unittest.TestCase):
             self.assertEqual(j.run(out=io.StringIO(), report=lambda _: None), 1)
         j.delete.assert_not_called()
 
+    def test_retry_follow_does_not_keep_an_old_monitoring_error(self):
+        j = self.finished(state='Running')
+        p = pod()
+        j.core.read_namespaced_pod.return_value = p
+        with mock.patch.object(core, 'STATUS_GRACE_SECONDS', 0):
+            self.assertEqual(j.follow(out=io.StringIO(), report=lambda _: None), 1)
+        p.status.container_statuses = self.finished(code=0, log_saved=True).core.read_namespaced_pod.return_value.status.container_statuses
+        j.state.return_value = 'Succeeded'
+        self.assertEqual(j.follow(out=io.StringIO(), report=lambda _: None), 0)
+        self.assertTrue(j.cleanup_finished(report=lambda _: None))
+        j.delete.assert_called_once()
+
     def test_wrong_run_metadata_is_not_used(self):
         j = self.finished()
         j.run_id = 'different'
@@ -149,6 +161,45 @@ class MonitoringTests(unittest.TestCase):
                 cli.cmd_acct(argparse.Namespace(n=0))
             rows = out.getvalue().splitlines()[1:]
             self.assertEqual([row.split()[5:7] for row in rows], [['LOG_ERROR', '74'], ['COMPLETED', '0']])
+
+    def accounting_result(self, j, state='Running'):
+        obj = {'metadata': {'name': j.spec.name, 'uid': 'old', 'annotations': {'kjob/run-id': 'abc123'}}}
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'job.log'
+            log.write_text('[kjob 2026-01-01T00:00:01Z] start job on node n run abc123\n'
+                           '[kjob 2026-01-01T00:00:02Z] exit code 0 run abc123\n')
+            hist = [{'name': j.spec.name, 'run_id': 'abc123', 'submitted': '2026-01-01T00:00:00Z',
+                     'log': str(log), 'gpus': 0}]
+            out = io.StringIO()
+            with mock.patch.object(core, 'read_history', return_value=hist), \
+                    mock.patch.object(core, 'read_events', return_value=[]), \
+                    mock.patch.object(core, 'list_jobs', return_value=[obj]), \
+                    mock.patch.object(core, 'job_state', return_value=state), \
+                    mock.patch.object(cli, '_job_for', return_value=j), mock.patch('sys.stdout', out):
+                cli.cmd_acct(argparse.Namespace(n=0))
+            return out.getvalue().splitlines()[1].split()[5:7]
+
+    def test_background_accounting_checks_wrapper_status_without_kwait(self):
+        for code, saved, expected in [(74, False, ['LOG_ERROR', '74']), (0, True, ['COMPLETED', '0'])]:
+            with self.subTest(code=code):
+                self.assertEqual(self.accounting_result(self.finished(code=code, log_saved=saved)), expected)
+
+    def test_background_accounting_does_not_call_log_exit_a_finished_container(self):
+        for state, expected in [('Created', 'PENDING'), ('Running', 'RUNNING'), ('Succeeded', 'UNCONFIRMED')]:
+            j = self.finished()
+            j.core.read_namespaced_pod.return_value = pod()  # no terminated main container yet
+            with self.subTest(state=state):
+                self.assertEqual(self.accounting_result(j, state), [expected, '-'])
+
+    def test_background_accounting_api_failure_does_not_report_success(self):
+        j = self.finished()
+        j.core.read_namespaced_pod.side_effect = core.ApiException(status=503)
+        self.assertEqual(self.accounting_result(j), ['UNCONFIRMED', '-'])
+
+    def test_background_accounting_does_not_read_a_replacement_pod_result(self):
+        j = self.finished()
+        j.core.read_namespaced_pod.return_value = pod(uid='new', phase='Succeeded', code=0)
+        self.assertEqual(self.accounting_result(j), ['RUNNING', '-'])  # CR state only; foreign exit 0 is ignored
 
 
 class ResourceTests(unittest.TestCase):
