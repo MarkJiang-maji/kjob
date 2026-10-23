@@ -138,6 +138,9 @@ kqueue -u mxxxxxxx        # one user's (namespace's) workloads
 * `CUDA out of memory`: smaller batch, or a GPU type with more memory.
 * `No such file or directory`: script or data not on a shared volume, or a relative path; use absolute paths.
 * `ModuleNotFoundError`: package installed somewhere the job cannot see; see step 2.
+* `log write failed` / `LOG_ERROR`: the Pod is retained. Save `klogs NAME` to writable shared storage before
+  `--ttl`, `kcancel`, or `kclean` removes it. Exit 74 means log storage failed; existing script errors keep their code.
+* `log stream ended but completion could not be confirmed`: the job is retained. Check `kshow NAME`, then retry `kwait NAME`.
 * Stopped at the time limit: "stopped at the time limit" / `DeadlineExceeded` (ksrun/kwait/kshow; they exit with 124 even if the
   script saved and exited 0), `STOPPED` in kacct (`CANCELLED`: deleted by kcancel before it could log an end). Training code should handle
   SIGTERM (save a checkpoint) since it gets 30 s before being killed; resubmit with a larger `-t` and

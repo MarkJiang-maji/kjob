@@ -9,6 +9,7 @@ ReadWriteOnce claims that are backed by NFS are mounted as the underlying NFS ex
 from __future__ import annotations
 
 import datetime as _dt
+import codecs
 import copy
 import json
 import os
@@ -49,6 +50,8 @@ SHARING_STRATEGY_LABEL = "nvidia.com/gpu.sharing-strategy"
 TERMINAL = ("Succeeded", "Failed", "Deleted")  # Deleted: the job is gone (kcancel elsewhere, TTL)
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, "2Gi"
 DEFAULT_SHM = None   # /dev/shm limit = --mem: only a cap (its use counts toward memory), big enough for DataLoader workers
+STATUS_GRACE_SECONDS = 30  # after the log stream ends, do not wait forever for an operator update
+LOG_FRAGMENT_CHARS = 64 * 1024  # progress output may never contain a newline
 
 
 def unique_name(stem: str) -> str:
@@ -169,20 +172,25 @@ def _own_container_refs(e: client.V1EnvVar, notebook_container: str) -> client.V
     return e
 
 
-def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "") -> str:
+def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
+              termination_log: str = "/dev/termination-log") -> str:
     """Container command. Output goes to the pod log and to the log file. The script runs in its own process group
     and gets the SIGTERM sent at the -t limit or by kcancel, so it can save state within the grace period
     (bash as PID 1 would otherwise ignore SIGTERM and everything is killed 30 s later)."""
     q, ts = shlex.quote, "$(date -u +%FT%TZ)"
     run = f" run {run_id}" if run_id else ""      # on every [kjob] line: runs sharing a log file stay apart
+    result = '{"kjob":1,"run_id":' + json.dumps(run_id) + ',"log_saved":%s,"script_exit_code":%s}\\n'
     return (
         "set -o pipefail\n"
         f"log={q(log)}\n"
+        # Kubelet stores this outside the shared log volume, even when that volume is full.
+        f'write_result() {{ (printf {q(result)} "$1" "$2" > {q(termination_log)}) 2>/dev/null || :; }}\n'
         # without a writable log the output would be lost while the job still reports success: stop before starting
         f'if ! {{ mkdir -p {q(str(Path(log).parent))} && : >> "$log"; }} 2>/dev/null; then\n'
         f'  echo "[kjob {ts}] cannot write the log file $log (missing directory, a file in the way, or no permission);'
-        ' the script was not started"; exit 1; fi\n'
-        f'cd {q(workdir)} || {{ echo "[kjob {ts}] cannot enter the working directory "{q(workdir)} | tee -a "$log"; exit 1; }}\n'
+        ' the script was not started"; write_result false null; exit 74; fi\n'
+        f'cd {q(workdir)} || {{ echo "[kjob {ts}] cannot enter the working directory "{q(workdir)} | tee -a "$log"; '
+        'if [ "$?" -eq 0 ]; then write_result true null; else write_result false null; fi; exit 1; }\n'
         'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
         f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel){run}\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
@@ -193,11 +201,17 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "")
         '  echo $! > "$state.pid"; wait $!; rc=$?\n'
         f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" &\n'
         "tee_pid=$!\n"
-        "while kill -0 $tee_pid 2>/dev/null; do wait $tee_pid; tee_rc=$?; done\n"
+        # Always reap the pipeline, even if a very short job finished before this shell got here.
+        # A TERM trap can interrupt wait; wait again while the pipeline is still alive.
+        "while :; do wait $tee_pid; tee_rc=$?; kill -0 $tee_pid 2>/dev/null || break; done\n"
         'rc=$(cat "$state.rc" 2>/dev/null || echo 1)\n'
-        'if [ "${tee_rc:-0}" -ne 0 ] && [ "${tee_rc:-0}" -lt 128 ]; then\n'
-        f'  echo "[kjob {ts}] warning: writing the log file $log failed part way (disk full or storage error);'
-        ' the pod log is complete, the file may not be"; fi\n'
+        'if [ "$tee_rc" -ne 0 ]; then\n'
+        '  write_result false "$rc"\n'
+        '  [ "$rc" -ne 0 ] || rc=74\n'
+        f'  echo "[kjob {ts}] log write failed: $log; recover the pod log with klogs {name}{run}"\n'
+        f'  echo "[kjob {ts}] exit code $rc{run}"\n'
+        'else write_result true "$rc"; fi\n'
+        'rm -f "$state.pid" "$state.rc"\n'
         'exit "$rc"\n')
 
 
@@ -299,9 +313,8 @@ class NotebookTemplate:
                 t.volumes.append(client.V1Volume(name=v.name, nfs=client.V1NFSVolumeSource(server=server, path=path, read_only=readonly)))
                 t.volume_mounts.append(client.V1VolumeMount(name=v.name, mount_path=m.mount_path, read_only=readonly))
             elif v.empty_dir is not None:
-                medium = v.empty_dir.medium
-                t.volumes.append(client.V1Volume(name=v.name, empty_dir=client.V1EmptyDirVolumeSource(
-                    medium=medium, size_limit=shm_size if medium == "Memory" else None)))
+                # Only manifest() resizes /dev/shm. Scratch volumes keep their own medium and size limit.
+                t.volumes.append(copy.deepcopy(v))
                 t.volume_mounts.append(copy.deepcopy(m))
             else:  # PVC on non-NFS storage, nfs, secret, configMap, ...: reuse as-is
                 t.volumes.append(v)
@@ -433,6 +446,7 @@ class KJob:
             volume_mounts.append(client.V1VolumeMount(name=name, mount_path="/dev/shm"))
         container = client.V1Container(
             name="pytorch", image=t.image, command=["bash", "-lc", shell], working_dir=workdir, env=env,
+            termination_message_policy="FallbackToLogsOnError",
             env_from=t.env_from or None,
             security_context=t.container_security_context,
             resources=client.V1ResourceRequirements(requests=res, limits=res), volume_mounts=volume_mounts)
@@ -468,6 +482,7 @@ class KJob:
             "metadata": {"name": s.name, "namespace": self.ns,
                          "labels": {"app.kubernetes.io/managed-by": MANAGED_BY, "kjob/notebook": t.pod_name},
                          "annotations": {"kjob/command": s.command()[:2000], "kjob/log": log,
+                                         "kjob/run-id": self.run_id,
                                          "kjob/workdir": workdir,
                                          "kjob/submitted": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}},
             "spec": {
@@ -619,15 +634,22 @@ class KJob:
         self._pod()
         resp = self.core.read_namespaced_pod_log(self.pod_name, self.ns, container="pytorch", follow=True,
                                                  _preload_content=False)
-        buf = b""
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        buf = ""
         try:
             for chunk in resp.stream(1024):
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    yield line.decode(errors="replace")
+                buf += decoder.decode(chunk)
+                while "\n" in buf or len(buf) >= LOG_FRAGMENT_CHARS:
+                    end = buf.find("\n")
+                    if end < 0 or end > LOG_FRAGMENT_CHARS:
+                        yield buf[:LOG_FRAGMENT_CHARS]
+                        buf = buf[LOG_FRAGMENT_CHARS:]
+                    else:
+                        yield buf[:end]
+                        buf = buf[end + 1:]
+            buf += decoder.decode(b"", final=True)
             if buf:
-                yield buf.decode(errors="replace")
+                yield buf
         finally:
             resp.close()
 
@@ -695,12 +717,22 @@ class KJob:
         for cs in pod.status.container_statuses or []:     # only the job's own container: a sidecar's 0 is not ours
             if cs.name == "pytorch" and cs.state.terminated is not None:
                 self.exit_reason = cs.state.terminated.reason  # e.g. OOMKilled, Error, Completed
+                try:
+                    result = json.loads(cs.state.terminated.message or "{}")
+                    if (isinstance(result, dict) and result.get("kjob") == 1
+                            and result.get("run_id") == getattr(self, "run_id", result.get("run_id"))):
+                        self.run_id = result.get("run_id")
+                        self.log_failed = result.get("log_saved") is False
+                except (ValueError, TypeError):
+                    pass  # old wrappers, OOM, or kubelet's fallback text: no structured result
                 return cs.state.terminated.exit_code
         return None
 
     def follow(self, out=sys.stdout, report=None) -> int:
         """Wait for the pod, stream its output, wait for the job to end; return the script's exit code."""
         report = report or (lambda m: print(m, file=sys.stderr, flush=True))
+        self.monitor_incomplete = False
+        self.main_finished = False
         last_code = None
         phase = self.wait_for_pod(report=report)
         if phase == "Invalid":
@@ -715,17 +747,35 @@ class KJob:
                     if m:
                         last_code = int(m.group(1))
                     else:
+                        if re.match(r"\[kjob [^\]]*\] log write failed:", line):
+                            self.log_failed = True
                         print(line, file=out, flush=True)
             except ApiException as e:
                 if e.status != 404:
                     raise
                 report(f"kjob: {self.spec.name} pod disappeared; checking job status")
         st = self.state()
+        code = self.exit_code()
+        deadline = time.monotonic() + STATUS_GRACE_SECONDS
         while st not in TERMINAL:  # pod finished; the operator updates the job status shortly after
+            if code is not None:
+                # A crashed or lagging operator must not make a finished script wait forever.
+                report(f"kjob: {self.spec.name} main container ended; operator status is still {st}")
+                st = "Succeeded" if code == 0 else "Failed"
+                break
+            if time.monotonic() >= deadline:
+                self.monitor_incomplete = True
+                report(f"kjob: {self.spec.name} log stream ended but completion could not be confirmed. "
+                       f"Keeping the job; reconnect with kwait {self.spec.name} or inspect kshow {self.spec.name}.")
+                return 1
             time.sleep(2)
             st = self.state()
-        code = self.exit_code()
+            code = self.exit_code()
+        self.main_finished = code is not None
         code = code if code is not None else last_code
+        if getattr(self, "log_failed", False):
+            code = code if code not in (None, 0) else 74
+            record_event("log-error", self.spec.name, run_id=getattr(self, "run_id", None), exit_code=code)
         reason = self.stop_reason() or getattr(self, "exit_reason", None)
         if reason == "DeadlineExceeded":       # stopped at -t: not a success even if the script saved and exited 0
             report(f"kjob: {self.spec.name} stopped at the time limit (-t); the script exited with {code} after SIGTERM. "
@@ -734,6 +784,19 @@ class KJob:
         detail = f", {reason}" if reason and reason not in ("Completed", "Error") else ""
         report(f"kjob: {self.spec.name} {st} (exit code {code}{detail})")
         return code if code is not None else (0 if st == "Succeeded" else 1)
+
+    def cleanup_finished(self, report=print) -> bool:
+        """Keep the last copy of the output when saving to the shared log failed."""
+        if getattr(self, "monitor_incomplete", False):
+            return False  # a monitoring failure is not a cancellation request
+        self.exit_code()  # also reads the termination message when kwait was interrupted after completion
+        if getattr(self, "log_failed", False):
+            report(f"kjob: {self.spec.name} log was not saved completely; keeping the finished job and Pod. "
+                   f"Recover with klogs {self.spec.name} > /path/on/writable/storage/{self.spec.name}.log, "
+                   f"then kcancel {self.spec.name}. The configured --ttl still applies.")
+            return False
+        self.delete()
+        return True
 
     def run(self, out=sys.stdout, cleanup: bool = True, report=None) -> int:
         """srun semantics: submit, stream output, wait, delete the job, return the exit code."""
@@ -749,7 +812,7 @@ class KJob:
                 self.delete()
             return 130 if isinstance(e, KeyboardInterrupt) else 141
         if cleanup:
-            self.delete()
+            self.cleanup_finished(report)
         return code
 
 
@@ -794,8 +857,9 @@ def read_events() -> list[dict]:
     return [r for r in _history_lines() if "event" in r]
 
 
-def record_event(event: str, name: str) -> None:
-    rec = {"event": event, "name": name, "time": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+def record_event(event: str, name: str, **details) -> None:
+    rec = {"event": event, "name": name, "time": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           **details}
     try:
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with HISTORY_FILE.open("a") as f:

@@ -7,6 +7,7 @@
 * **GPU 自動分配**：不指定型號就排到任何有空的整張 GPU，沒空就排隊、有空自動開始；Notebook 本身不用占 GPU。
 * **自動收尾**：輸出即時顯示並存到 `~/kjob-logs/工作名稱.log`；`ksrun` 結束就刪除工作，`ksub` 在 `--ttl` 秒後
   自動刪除；`-t` 時間到先送 SIGTERM，程式有 30 秒存檔。
+  日誌保存失敗時，`ksrun`／`kwait` 會回報錯誤並保留已結束的 Pod，可用 `klogs` 取回輸出；原有 `--ttl` 仍適用。
 
 ## 安裝（在 Notebook 的 Terminal）
 

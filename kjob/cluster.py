@@ -39,11 +39,18 @@ def _iso(ts) -> str | None:
 
 
 def _requests(pod, key: str) -> float:
-    """What the scheduler reserves: the larger of the containers' sum and any one init container, plus overhead."""
+    """Effective request, including overlapping restartable init sidecars and Pod overhead."""
     def req(c):
         v = ((c.resources and c.resources.requests) or {}).get(key)
         return float(parse_quantity(v)) if v is not None else 0.0
-    total = max([sum(req(c) for c in pod.spec.containers or [])] + [req(c) for c in pod.spec.init_containers or []])
+    sidecars, init_peak = 0.0, 0.0
+    for c in pod.spec.init_containers or []:
+        if getattr(c, "restart_policy", None) == "Always":
+            sidecars += req(c)
+            init_peak = max(init_peak, sidecars)
+        else:
+            init_peak = max(init_peak, sidecars + req(c))
+    total = max(sum(req(c) for c in pod.spec.containers or []) + sidecars, init_peak)
     overhead = (pod.spec.overhead or {}).get(key)
     return total + (float(parse_quantity(overhead)) if overhead is not None else 0.0)
 

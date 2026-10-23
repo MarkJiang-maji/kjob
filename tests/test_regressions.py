@@ -312,12 +312,12 @@ class InheritanceTests(unittest.TestCase):
         p.spec.tolerations = [
             client.V1Toleration(key='node.kubernetes.io/not-ready', operator='Exists', effect='NoExecute', toleration_seconds=300),
             client.V1Toleration(key='dedicated', operator='Equal', value='team-a', effect='NoSchedule'),
-            client.V1Toleration(key='restricted-gpu', operator='Equal', value='advance', effect='NoSchedule')]
+            client.V1Toleration(key='example.com/gpu-access', operator='Equal', value='enabled', effect='NoSchedule')]
         return p
 
     DEFAULTS = {'items': PODDEFAULTS['items'] + [{'spec': {
         'env': [{'name': 'SHARED_DIR', 'value': '/nfs'}], 'envFrom': [{'secretRef': {'name': 'pd-secret'}}],
-        'tolerations': [{'key': 'restricted-gpu', 'operator': 'Equal', 'value': 'advance', 'effect': 'NoSchedule'}]}}]}
+        'tolerations': [{'key': 'example.com/gpu-access', 'operator': 'Equal', 'value': 'enabled', 'effect': 'NoSchedule'}]}}]}
 
     def test_env_envfrom_runtime_class_and_tolerations_are_inherited(self):
         m = manifest_from(load_template(self.notebook(), self.DEFAULTS), gpus=0)
@@ -481,7 +481,7 @@ class ErrorOutputTests(unittest.TestCase):
         self.assertNotIn('Traceback', err)
 
     def test_refusals_print_the_reason_without_the_usage_text(self):
-        code, err = run_main(ValueError('Namespace me has no access to the requested GPUs on rtxpro6000'), cmd='submit')
+        code, err = run_main(ValueError('Namespace me has no access to the requested GPUs on gpu-node-restricted'), cmd='submit')
         self.assertEqual(code, 2)
         self.assertTrue(err.startswith('kjob: Namespace me has no access'), err)
         self.assertNotIn('usage:', err)
@@ -502,9 +502,9 @@ def core_http_error():
 
 class RestrictedAccessTests(unittest.TestCase):
     SNAP = {'nodes': [
-        {'name': 'hs5800-3', 'product': 'Tesla-V100-SXM2-16GB', 'restricted': [], 'sharing': '', 'gpus': 8},
-        {'name': 'rtxpro6000', 'product': 'NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition',
-         'restricted': ['restricted-gpu=advance'], 'sharing': '', 'gpus': 8}]}
+        {'name': 'gpu-node-open', 'product': 'Tesla-V100-SXM2-16GB', 'restricted': [], 'sharing': '', 'gpus': 8},
+        {'name': 'gpu-node-restricted', 'product': 'NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition',
+         'restricted': ['example.com/gpu-access=enabled'], 'sharing': '', 'gpus': 8}]}
     RTX = 'NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition'
 
     def check(self, types, node=None, tol=(), exclude=()):
@@ -514,17 +514,17 @@ class RestrictedAccessTests(unittest.TestCase):
             cli._check_access(types, node, list(exclude), 1)
 
     def test_restricted_type_without_access_is_refused_before_submitting(self):
-        with self.assertRaisesRegex(ValueError, r'(?s)no access.*rtxpro6000.*administrator'):
+        with self.assertRaisesRegex(ValueError, r'(?s)no access.*gpu-node-restricted.*administrator'):
             self.check([self.RTX])
         with self.assertRaisesRegex(ValueError, 'no access'):
-            self.check([], node='rtxpro6000')
+            self.check([], node='gpu-node-restricted')
 
     def test_allowed_or_mixed_requests_pass(self):
-        self.check([self.RTX], tol=[{'key': 'restricted-gpu', 'operator': 'Equal', 'value': 'advance', 'effect': 'NoSchedule'}])
+        self.check([self.RTX], tol=[{'key': 'example.com/gpu-access', 'operator': 'Equal', 'value': 'enabled', 'effect': 'NoSchedule'}])
         self.check(['v100', self.RTX])                       # V100 is usable, so the job can start
         self.check([])                                       # any GPU
         with self.assertRaisesRegex(ValueError, 'no access'):
-            self.check(['v100', self.RTX], exclude=['hs5800-3'])
+            self.check(['v100', self.RTX], exclude=['gpu-node-open'])
 
     def test_unknown_tolerations_skip_the_check(self):
         with mock.patch.object(cluster_mod(), 'load_snapshot', return_value=self.SNAP), \
@@ -533,7 +533,7 @@ class RestrictedAccessTests(unittest.TestCase):
 
     def test_notebook_tolerations_count(self):
         p = notebook_pod()
-        p.spec.tolerations = [client.V1Toleration(key='restricted-gpu', operator='Equal', value='advance', effect='NoSchedule'),
+        p.spec.tolerations = [client.V1Toleration(key='example.com/gpu-access', operator='Equal', value='enabled', effect='NoSchedule'),
                               client.V1Toleration(key='node.kubernetes.io/not-ready', operator='Exists', effect='NoExecute')]
         c, o = mock.Mock(), mock.Mock()
         c.read_namespaced_pod.return_value = p
@@ -541,7 +541,7 @@ class RestrictedAccessTests(unittest.TestCase):
         with mock.patch.object(core.client, 'CoreV1Api', return_value=c), mock.patch.object(core.client, 'CustomObjectsApi', return_value=o), \
              mock.patch.object(core, 'current_namespace', return_value='me'), mock.patch.object(core, 'current_notebook', return_value='nb-0'):
             tol = cli._my_tolerations()
-        self.assertIn({'key': 'restricted-gpu', 'operator': 'Equal', 'value': 'advance', 'effect': 'NoSchedule'}, tol)
+        self.assertIn({'key': 'example.com/gpu-access', 'operator': 'Equal', 'value': 'enabled', 'effect': 'NoSchedule'}, tol)
         self.assertFalse(any((t.get('key') or '').startswith('node.kubernetes.io/') for t in tol))
 
 

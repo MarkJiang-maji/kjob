@@ -35,6 +35,7 @@
 * namespace 的 **PodDefault**（例如共用 NFS、受限 GPU 節點的 toleration）也會套用到工作。
 * 工作的輸出用 `tee` 同時寫到 Pod log 和 `~/kjob-logs/NAME.log`。
 * 工作結束後 Pod 保留供查看，工作物件在 `--ttl` 秒後自動刪除；`ksrun`、`kwait` 會在結束時直接刪除。
+  日誌保存失敗或無法確認完成時會保留工作，方便檢查；`--ttl` 仍適用。
 
 ## 安裝與更新
 
@@ -97,6 +98,10 @@ worker），所以主程式可能先看到 worker 結束的錯誤；存檔的 ha
 
 * 排隊時顯示排程訊息（例如 GPU 不足），開始後即時輸出，結束時印出 `Succeeded/Failed (exit code N)`。
 * 結束代碼就是程式的結束代碼，可用在 shell 腳本：`ksrun ... && echo ok`。
+  日誌寫入失敗則回傳 74（程式本身已失敗時保留原代碼），`kacct` 顯示 `LOG_ERROR`。
+* `kacct` 查詢失敗時顯示 `UNCONFIRMED`；離線結果只依已存紀錄推算。
+* 主容器退出即可完成；log stream 結束後仍無法確認結果，最多再等 30 秒便回報錯誤。用 `kwait NAME` 重接。
+  這 30 秒不是訓練時限或 API timeout。
 * Ctrl-C 會**取消**工作。連線中斷時工作不受影響，之後用 `kqueue`、`kwait` 查看。
 
 ## 腳本內設定：#SBATCH / #KJOB
@@ -284,6 +289,8 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 | `ModuleNotFoundError` | 套件只裝在 Notebook 系統目錄；改用 `pip install --user` 或 `/home/jovyan` 上的虛擬環境 + `--python` |
 | `stopped at the time limit`、`DeadlineExceeded`（ksrun／kwait／kshow 顯示） | 超過 `-t` 時間上限；程式有收到 SIGTERM，可在 handler 存 checkpoint 後續跑。即使程式存完檔正常結束，`ksrun`／`kwait` 也回傳 124，不當成成功 |
 | `cannot write the log file ...; the script was not started` | 日誌目錄不存在、被同名檔案擋住或沒有寫入權限，程式沒有執行。檢查 `-o` 指定的目錄（預設 `~/kjob-logs`） |
+| `log write failed`、`LOG_ERROR` | 日誌未存完整，Pod 會保留。先用 `klogs NAME > /可寫的共用磁碟/NAME.log` 取回，再 `kcancel NAME`。請在 `--ttl` 到期或執行 `kclean` 前取回。 |
+| `log stream ended but completion could not be confirmed` | 監看結束但沒有可靠終態，工作沒有被取消。用 `kshow NAME` 看狀態或 `kwait NAME` 重新接上。 |
 | `cuda: False` | 用了 `-G 0`，或 image／環境沒有 CUDA 版 PyTorch |
 | `kjob: Kubernetes API error (403 Forbidden): ... cannot create resource "pytorchjobs" ...` | Notebook 的帳號沒有這個權限。訊息裡會寫是哪個帳號、缺什麼。Kubeflow 介面建立的 Notebook 用 `default-editor`，權限是齊的；不是的話重新從介面建 Notebook，否則請管理員處理（[ADMIN.md](ADMIN.md) 有權限清單） |
 | `kjob: Kubernetes API error (403 Forbidden): exceeded quota` | namespace 配額用完（Notebook 也算在內）：看 `kinfo`，等其他工作結束或少要一點 |
