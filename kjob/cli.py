@@ -569,10 +569,12 @@ def cmd_logs(a) -> int:
     except KeyboardInterrupt:
         return 130
     except ApiException as e:
-        if e.status == 400:
+        if j.is_evicted_log_exception(e):
+            report(f"kjob: {a.name} log stream unavailable after eviction; trying the saved log")
+        elif e.status == 400:
             report(f"kjob: {a.name} has not started yet; try klogs -f {a.name}")
             return 0
-        if e.status != 404:
+        elif e.status != 404:
             raise
     try:
         obj = j.custom.get_namespaced_custom_object(core.GROUP, core.VERSION, j.ns, core.PLURAL, a.name)
@@ -583,7 +585,8 @@ def cmd_logs(a) -> int:
     log = log or (rec or {}).get("log") or str(Path(a.log_dir) / f"{a.name}.log")
     if os.path.exists(log):
         print(f"kjob: pod not available; showing {log}", file=sys.stderr)
-        print(open(log).read(), end="")
+        with open(log, newline="") as saved:
+            print(saved.read(), end="")
         return 0
     print(f"kjob: no pod and no log file for {a.name}", file=sys.stderr)
     return 1
@@ -669,6 +672,8 @@ def cmd_acct(a) -> int:
                 pod_code = j.exit_code()
                 if getattr(j, "log_failed", False):
                     actual = ("LOG_ERROR", pod_code)
+                elif j.stop_reason() == "Evicted":
+                    actual = ("EVICTED", pod_code or 1)
                 elif pod_code is not None:
                     actual = ("COMPLETED" if pod_code == 0 else "FAILED", pod_code)
                 else:
@@ -682,7 +687,7 @@ def cmd_acct(a) -> int:
             code = log_errors[r["run_id"]].get("exit_code", code)
         elif actual is not None:
             state, code = actual
-            if run and run["stopped"] and state != "LOG_ERROR":
+            if run and run["stopped"] and state not in ("LOG_ERROR", "EVICTED"):
                 state = "STOPPED"
         elif run and run["stopped"]:
             state = "STOPPED"      # time limit or kcancel

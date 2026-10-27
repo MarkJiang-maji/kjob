@@ -737,6 +737,9 @@ class KJob:
         return bool(re.match(r"^rpc error: code = (?:Unknown|NotFound) desc = .*No such container\b", line)
                     and self.stop_reason() == "Evicted")
 
+    def is_evicted_log_exception(self, error: ApiException) -> bool:
+        return error.status in (400, 404) and self.stop_reason() == "Evicted"
+
     def exit_code(self) -> int | None:
         try:
             pod = self._pod()
@@ -788,9 +791,13 @@ class KJob:
                         print(line, end="" if isinstance(line, LogFragment) or line.endswith("\r") else "\n",
                               file=out, flush=True)
             except ApiException as e:
-                if e.status != 404:
+                if self.is_evicted_log_exception(e):
+                    report(f"kjob: {self.spec.name} log stream unavailable after eviction; "
+                           f"use klogs {self.spec.name} to read the saved log")
+                elif e.status == 404:
+                    report(f"kjob: {self.spec.name} pod disappeared; checking job status")
+                else:
                     raise
-                report(f"kjob: {self.spec.name} pod disappeared; checking job status")
         st = self.state()
         code = self.exit_code()
         deadline = time.monotonic() + STATUS_GRACE_SECONDS
@@ -817,6 +824,9 @@ class KJob:
             report(f"kjob: {self.spec.name} stopped at the time limit (-t); the script exited with {code} after SIGTERM. "
                    f"Exit status 124")
             return code if code not in (None, 0) else 124
+        if reason == "Evicted":
+            report(f"kjob: {self.spec.name} Evicted (script exit code {code})")
+            return code if code not in (None, 0) else 1
         detail = f", {reason}" if reason and reason not in ("Completed", "Error") else ""
         report(f"kjob: {self.spec.name} {st} (exit code {code}{detail})")
         return code if code is not None else (0 if st == "Succeeded" else 1)

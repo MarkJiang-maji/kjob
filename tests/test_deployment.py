@@ -303,6 +303,44 @@ class MonitoringTests(unittest.TestCase):
                 self.assertEqual(out.getvalue(), 'checkpoint saved\n')
                 self.assertIn(diagnostic, err.getvalue())
 
+    def test_evicted_pod_with_unavailable_logs_still_reports_failure(self):
+        for status in (400, 404):
+            for code in (0, 143):
+                with self.subTest(status=status, code=code):
+                    j = self.finished(code=code, log_saved=True)
+                    j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+                    j.stream_logs = mock.Mock(side_effect=core.ApiException(status=status))
+                    messages = []
+                    self.assertEqual(j.follow(out=io.StringIO(), report=messages.append), code or 1)
+                    self.assertIn('Evicted', messages[-1])
+                    self.assertTrue(any('log stream unavailable after eviction' in m for m in messages))
+        j = self.finished(code=143, log_saved=True)
+        j.stream_logs = mock.Mock(side_effect=core.ApiException(status=400))
+        with self.assertRaises(core.ApiException):
+            j.follow(out=io.StringIO(), report=lambda _: None)
+
+    def test_klogs_recovers_saved_bytes_when_evicted_container_is_gone(self):
+        for follow in (False, True):
+            for exists in (False, True):
+                with self.subTest(follow=follow, exists=exists), tempfile.TemporaryDirectory() as d:
+                    log = Path(d)/'saved.log'
+                    payload = b'\r10%\r100%\nCRLF\r\n'
+                    if exists:
+                        log.write_bytes(payload)
+                    j = self.finished(code=143, log_saved=True)
+                    j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+                    j.stream_logs = mock.Mock(side_effect=core.ApiException(status=400))
+                    j.core.read_namespaced_pod_log.side_effect = core.ApiException(status=400)
+                    j.custom.get_namespaced_custom_object.return_value = {'metadata': {'annotations': {'kjob/log': str(log)}}}
+                    out, err = io.StringIO(), io.StringIO()
+                    with mock.patch.object(cli, '_job_for', return_value=j), mock.patch.object(core, 'read_history', return_value=[]), \
+                            mock.patch('sys.stdout', out), mock.patch('sys.stderr', err):
+                        rc = cli.cmd_logs(argparse.Namespace(name=j.spec.name, follow=follow, log_dir=d))
+                    self.assertEqual(rc, 0 if exists else 1)
+                    self.assertEqual(out.getvalue(), payload.decode() if exists else '')
+                    self.assertIn('after eviction', err.getvalue())
+                    self.assertNotIn('has not started', err.getvalue())
+
     def test_log_error_accounting_is_bound_to_run_not_reused_name(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / 'same.log'
@@ -342,6 +380,11 @@ class MonitoringTests(unittest.TestCase):
         for code, saved, expected in [(74, False, ['LOG_ERROR', '74']), (0, True, ['COMPLETED', '0'])]:
             with self.subTest(code=code):
                 self.assertEqual(self.accounting_result(self.finished(code=code, log_saved=saved)), expected)
+
+    def test_evicted_script_exiting_zero_is_not_accounted_as_completed(self):
+        j = self.finished(code=0, log_saved=True)
+        j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+        self.assertEqual(self.accounting_result(j), ['EVICTED', '1'])
 
     def test_background_accounting_does_not_call_log_exit_a_finished_container(self):
         for state, expected in [('Created', 'PENDING'), ('Running', 'RUNNING'), ('Succeeded', 'UNCONFIRMED')]:
