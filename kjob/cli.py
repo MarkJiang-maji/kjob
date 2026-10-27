@@ -545,13 +545,21 @@ def cmd_logs(a) -> int:
             if j.wait_for_pod(report=report) in ("Deleted", "Invalid"):   # still pending: wait instead of failing
                 raise ApiException(status=404)
             for line in j.stream_logs():
-                print(line, flush=True)
+                if j.is_evicted_log_error(line):
+                    report(f"kjob: {a.name} log stream unavailable after eviction: {line}")
+                    continue
+                print(line, end="" if isinstance(line, core.LogFragment) or line.endswith("\r") else "\n", flush=True)
         else:
             pod = j._pod()
             if pod.status.phase == "Pending":
                 report(f"kjob: {a.name} has not started yet (Pending); kshow {a.name} shows why, klogs -f waits")
                 return 0
-            print(j.core.read_namespaced_pod_log(j.pod_name, j.ns, container="pytorch"), end="")
+            text = j.core.read_namespaced_pod_log(j.pod_name, j.ns, container="pytorch")
+            for line in text.splitlines(keepends=True):
+                if j.is_evicted_log_error(line):
+                    report(f"kjob: {a.name} log stream unavailable after eviction: {line.rstrip()}")
+                else:
+                    print(line, end="")
         return 0
     except KeyboardInterrupt:
         return 130

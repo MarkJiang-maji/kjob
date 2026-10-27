@@ -54,6 +54,10 @@ STATUS_GRACE_SECONDS = 30  # after the log stream ends, do not wait forever for 
 LOG_FRAGMENT_CHARS = 64 * 1024  # progress output may never contain a newline
 
 
+class LogFragment(str):
+    """A partial log record to display without appending a newline."""
+
+
 def unique_name(stem: str) -> str:
     try:
         base = sanitize_name(stem)[:37].rstrip("-")
@@ -180,6 +184,15 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
     q, ts = shlex.quote, "$(date -u +%FT%TZ)"
     run = f" run {run_id}" if run_id else ""      # on every [kjob] line: runs sharing a log file stay apart
     result = '{"kjob":1,"run_id":' + json.dumps(run_id) + ',"log_saved":%s,"script_exit_code":%s}\\n'
+    # Container runtimes may hold partial lines until LF. Convert only the Pod
+    # display stream, after tee has saved the original bytes to shared storage.
+    display = ("import os\ncr = False\nwhile True:\n"
+               " data = os.read(0, 65536)\n"
+               " if not data: break\n"
+               " if cr and data.startswith(b'\\n'): data = data[1:]\n"
+               " cr = data.endswith(b'\\r')\n"
+               " data = data.replace(b'\\r\\n', b'\\r').replace(b'\\r', b'\\r\\n')\n"
+               " while data: data = data[os.write(1, data):]\n")
     return (
         "set -o pipefail\n"
         f"log={q(log)}\n"
@@ -192,14 +205,15 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
         f'cd {q(workdir)} || {{ echo "[kjob {ts}] cannot enter the working directory "{q(workdir)} | tee -a "$log"; '
         'if [ "$?" -eq 0 ]; then write_result true null; else write_result false null; fi; exit 1; }\n'
         'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
-        f"trap 'echo \"[kjob {ts}] stopping: SIGTERM (time limit or kcancel){run}\" | tee -a \"$log\"; "
+        f"trap 'echo \"[kjob {ts}] stopping: SIGTERM received{run}\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
         f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE{run}"\n'
         # background commands start with SIGINT ignored; restore it so KeyboardInterrupt works in the script
         f"  if command -v setsid >/dev/null 2>&1; then (trap - INT QUIT; exec setsid {command}) &\n"
         f"  else (trap - INT QUIT; exec {command}) & fi\n"
         '  echo $! > "$state.pid"; wait $!; rc=$?\n'
-        f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" &\n'
+        f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" '
+        f'| {q(sys.executable)} -u -c {q(display)} &\n'
         "tee_pid=$!\n"
         # Always reap the pipeline, even if a very short job finished before this shell got here.
         # A TERM trap can interrupt wait; wait again while the pipeline is still alive.
@@ -630,23 +644,35 @@ class KJob:
             time.sleep(3)
 
     def stream_logs(self) -> Iterator[str]:
-        """Yield log lines in real time until the container exits."""
+        """Yield lines and carriage-return updates until the container exits."""
         self._pod()
         resp = self.core.read_namespaced_pod_log(self.pod_name, self.ns, container="pytorch", follow=True,
                                                  _preload_content=False)
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         buf = ""
+        progress = False
         try:
-            for chunk in resp.stream(1024):
+            # read1 returns available bytes even inside a slowly written HTTP chunk.
+            # Older urllib3 releases need byte reads to avoid waiting for a full buffer.
+            chunks = (iter(lambda: resp.read1(1024), b"") if hasattr(type(resp), "read1")
+                      else resp.stream(1))
+            for chunk in chunks:
                 buf += decoder.decode(chunk)
-                while "\n" in buf or len(buf) >= LOG_FRAGMENT_CHARS:
-                    end = buf.find("\n")
+                while "\n" in buf or "\r" in buf or len(buf) >= LOG_FRAGMENT_CHARS:
+                    ends = [i for i in (buf.find("\n"), buf.find("\r")) if i >= 0]
+                    end = min(ends) if ends else -1
                     if end < 0 or end > LOG_FRAGMENT_CHARS:
                         yield buf[:LOG_FRAGMENT_CHARS]
                         buf = buf[LOG_FRAGMENT_CHARS:]
                     else:
-                        yield buf[:end]
+                        progress = buf[end] == "\r"
+                        yield buf[:end + 1] if buf[end] == "\r" else buf[:end]
                         buf = buf[end + 1:]
+                # tqdm starts updates with CR. Display the following text now,
+                # without waiting for the next update's CR or adding a newline.
+                if progress and buf:
+                    yield LogFragment(buf)
+                    buf = ""
             buf += decoder.decode(b"", final=True)
             if buf:
                 yield buf
@@ -707,6 +733,11 @@ class KJob:
         except ApiException:
             return None
 
+    def is_evicted_log_error(self, line: str) -> bool:
+        """Recognize a missing-runtime-container diagnostic only for an evicted Pod."""
+        return bool(re.match(r"^rpc error: code = (?:Unknown|NotFound) desc = .*No such container\b", line)
+                    and self.stop_reason() == "Evicted")
+
     def exit_code(self) -> int | None:
         try:
             pod = self._pod()
@@ -743,13 +774,17 @@ class KJob:
             try:
                 report(f"kjob: {self.spec.name} running on {self._pod().spec.node_name}")
                 for line in self.stream_logs():
+                    if self.is_evicted_log_error(line):
+                        report(f"kjob: {self.spec.name} log stream unavailable after eviction: {line}")
+                        continue
                     m = re.match(r"\[kjob [^\]]*\] exit code (\d+)( run [0-9a-f]+)?$", line)
                     if m:
                         last_code = int(m.group(1))
                     else:
                         if re.match(r"\[kjob [^\]]*\] log write failed:", line):
                             self.log_failed = True
-                        print(line, file=out, flush=True)
+                        print(line, end="" if isinstance(line, LogFragment) or line.endswith("\r") else "\n",
+                              file=out, flush=True)
             except ApiException as e:
                 if e.status != 404:
                     raise
@@ -760,7 +795,6 @@ class KJob:
         while st not in TERMINAL:  # pod finished; the operator updates the job status shortly after
             if code is not None:
                 # A crashed or lagging operator must not make a finished script wait forever.
-                report(f"kjob: {self.spec.name} main container ended; operator status is still {st}")
                 st = "Succeeded" if code == 0 else "Failed"
                 break
             if time.monotonic() >= deadline:

@@ -272,6 +272,7 @@ class NamesAndWrapperTest(unittest.TestCase):
             self.assertEqual(p.wait(timeout=10), 7)
             text = log.read_text()
             self.assertIn("stopping: SIGTERM", text)
+            self.assertNotIn("time limit or kcancel", text)
             self.assertIn("saving", text)
             runs = core.log_runs(str(log))
             self.assertEqual((len(runs), runs[0]["stopped"], runs[0]["code"]), (1, True, 7))

@@ -6,11 +6,15 @@ import os
 import shlex
 import subprocess
 import tempfile
+import queue
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 from kubernetes import client
+import urllib3
 from kjob import cli, cluster, core
 from test_audit_fixes import fixture
 from test_regressions import handle, pod, load_template, manifest_from
@@ -18,6 +22,17 @@ from test_kjob import pod_spec
 
 
 class LogStorageTests(unittest.TestCase):
+    def test_progress_is_line_framed_for_the_runtime_but_saved_bytes_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            log, term = Path(d)/'job.log', Path(d)/'termination.json'
+            command = "bash -c 'printf \"\\r10%%\\r20%%\\r\\ncomplete\\n\"'"
+            shell = core.job_shell('test', command, d, str(log), 'abc123', str(term))
+            p = subprocess.run(['bash','-c',shell], capture_output=True, timeout=10,
+                               env={**os.environ,'TMPDIR':d})
+            self.assertEqual(p.returncode, 0)
+            self.assertIn(b'\r10%\r20%\r\ncomplete\n', log.read_bytes())
+            self.assertIn(b'\r\n10%\r\n20%\r\ncomplete\n', p.stdout)
+
     def shell(self, directory, log, command):
         term = Path(directory) / 'termination.json'
         shell = core.job_shell('test', command, directory, str(log), 'abc123', str(term))
@@ -59,6 +74,113 @@ class LogStorageTests(unittest.TestCase):
 
 
 class MonitoringTests(unittest.TestCase):
+    def test_http_progress_is_visible_while_the_connection_is_still_open(self):
+        for chunked in (True, False, 'slow-chunk'):
+            with self.subTest(chunked=chunked):
+                release = threading.Event()
+                class Handler(BaseHTTPRequestHandler):
+                    protocol_version = 'HTTP/1.1'
+                    def log_message(self, *args):
+                        pass
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.send_header('Transfer-Encoding' if chunked else 'Connection',
+                                         'chunked' if chunked else 'close')
+                        self.end_headers()
+                        self.wfile.write(b'8\r\n1%\r' if chunked == 'slow-chunk'
+                                         else b'3\r\n1%\r\r\n' if chunked else b'1%\r')
+                        self.wfile.flush()
+                        release.wait(5)
+                        self.wfile.write(b'done\n\r\n0\r\n\r\n' if chunked == 'slow-chunk'
+                                         else b'5\r\ndone\n\r\n0\r\n\r\n' if chunked else b'done\n')
+                        self.wfile.flush()
+                        self.close_connection = True
+                server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                serving = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.05), daemon=True)
+                serving.start()
+                pool = urllib3.HTTPConnectionPool('127.0.0.1', server.server_port, timeout=3)
+                response = pool.request('GET', '/', preload_content=False)
+                j = handle()
+                j.core.read_namespaced_pod.return_value = pod()
+                j.core.read_namespaced_pod_log.return_value = response
+                received = queue.Queue()
+                def consume():
+                    try:
+                        for update in j.stream_logs():
+                            received.put(update)
+                    except Exception as error:
+                        received.put(error)
+                consumer = threading.Thread(target=consume, daemon=True)
+                consumer.start()
+                try:
+                    self.assertEqual(received.get(timeout=2), '1%\r')
+                    self.assertFalse(release.is_set())
+                finally:
+                    release.set()
+                    consumer.join(4)
+                    server.shutdown()
+                    server.server_close()
+                    pool.close()
+                    serving.join(1)
+                self.assertFalse(consumer.is_alive())
+                tail = []
+                while not received.empty():
+                    tail.append(received.get_nowait())
+                self.assertTrue(all(isinstance(x, str) for x in tail), tail)
+                self.assertEqual(''.join(x if isinstance(x, core.LogFragment) else x+'\n' for x in tail), 'done\n')
+
+    def test_short_carriage_return_updates_arrive_before_the_stream_ends(self):
+        j = handle()
+        j.core.read_namespaced_pod.return_value = pod()
+        response = j.core.read_namespaced_pod_log.return_value
+        def chunks():
+            yield '進度 1\r'.encode()
+            self.assertEqual(output.getvalue(), '進度 1\r')
+            yield b'progress 2\r'
+            self.assertEqual(output.getvalue(), '進度 1\rprogress 2\r')
+            yield b'done\n'
+        response.stream.return_value = chunks()
+        j.wait_for_pod = mock.Mock(return_value='Running')
+        j.state = mock.Mock(return_value='Succeeded')
+        j.exit_code = mock.Mock(return_value=0)
+        j.stop_reason = mock.Mock(return_value=None)
+        output = io.StringIO()
+        self.assertEqual(j.follow(out=output, report=lambda _: None), 0)
+        self.assertEqual(output.getvalue(), '進度 1\rprogress 2\rdone\n')
+
+    def test_tqdm_leading_carriage_return_does_not_wait_for_the_next_update(self):
+        j = self.finished(code=0, log_saved=True)
+        del j.stream_logs  # exercise the real reader and follow renderer
+        output = io.StringIO()
+        def chunks():
+            yield b'\r10%'
+            self.assertEqual(output.getvalue(), '\r10%')
+            yield b'\r20'
+            self.assertEqual(output.getvalue(), '\r10%\r20')
+            yield b'%\n'
+        j.core.read_namespaced_pod_log.return_value.stream.return_value = chunks()
+        self.assertEqual(j.follow(out=output, report=lambda _: None), 0)
+        self.assertEqual(output.getvalue(), '\r10%\r20%\n')
+
+    def test_klogs_follow_preserves_carriage_returns(self):
+        j = handle()
+        j.state = mock.Mock(return_value='Running')
+        j.wait_for_pod = mock.Mock(return_value='Running')
+        j.stream_logs = mock.Mock(return_value=iter(['10%\r', '100%\r', '']))
+        output = io.StringIO()
+        with mock.patch.object(cli, '_job_for', return_value=j), mock.patch('sys.stdout', output):
+            self.assertEqual(cli.cmd_logs(argparse.Namespace(name=j.spec.name, follow=True)), 0)
+        self.assertEqual(output.getvalue(), '10%\r100%\r\n')
+
+    def test_crlf_and_split_utf8_remain_intact(self):
+        j = handle()
+        j.core.read_namespaced_pod.return_value = pod()
+        raw = '測試\r\nprogress\rfinal\n'.encode()
+        j.core.read_namespaced_pod_log.return_value.stream.return_value = (bytes([b]) for b in raw)
+        updates = list(j.stream_logs())
+        text = ''.join(x if isinstance(x, core.LogFragment) or x.endswith('\r') else x+'\n' for x in updates)
+        self.assertEqual(text, raw.decode())
+
     def test_newline_free_progress_does_not_buffer_the_entire_job_output(self):
         j = handle()
         j.uid = 'old'
@@ -108,9 +230,11 @@ class MonitoringTests(unittest.TestCase):
     def test_main_exit_does_not_wait_for_a_stalled_operator(self):
         for code in (0, 7):
             j = self.finished(code=code, log_saved=True, state='Running')
+            messages = []
             with self.subTest(code=code), mock.patch.object(core.time, 'sleep') as sleep:
-                self.assertEqual(j.run(out=io.StringIO(), report=lambda _: None), code)
+                self.assertEqual(j.run(out=io.StringIO(), report=messages.append), code)
             sleep.assert_not_called()
+            self.assertFalse(any('operator status' in message for message in messages))
             j.delete.assert_called_once()
 
     def test_kwait_cleans_up_when_main_finished_but_operator_still_running(self):
@@ -143,6 +267,38 @@ class MonitoringTests(unittest.TestCase):
         j.run_id = 'different'
         self.assertEqual(j.exit_code(), 74)
         self.assertFalse(getattr(j, 'log_failed', False))
+
+    def test_missing_container_diagnostic_goes_to_stderr_only_after_eviction(self):
+        diagnostic = 'rpc error: code = Unknown desc = Error response from daemon: No such container: example'
+        for reason in ('Evicted', None):
+            with self.subTest(reason=reason):
+                j = self.finished(code=143, log_saved=True)
+                j.core.read_namespaced_pod.return_value.status.reason = reason
+                j.stream_logs = mock.Mock(return_value=iter(['saved checkpoint', diagnostic]))
+                out, messages = io.StringIO(), []
+                self.assertEqual(j.follow(out=out, report=messages.append), 143)
+                self.assertIn('saved checkpoint', out.getvalue())
+                if reason:
+                    self.assertNotIn('rpc error:', out.getvalue())
+                    self.assertTrue(any('log stream unavailable after eviction' in m for m in messages))
+                    self.assertIn('Evicted', messages[-1])
+                else:
+                    self.assertIn(diagnostic, out.getvalue())
+
+    def test_klogs_keeps_eviction_diagnostics_separate_from_output(self):
+        diagnostic = 'rpc error: code = Unknown desc = Error response from daemon: No such container: example'
+        for follow in (True, False):
+            with self.subTest(follow=follow):
+                j = self.finished(code=143, log_saved=True)
+                j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+                j.stream_logs = mock.Mock(return_value=iter(['checkpoint saved', diagnostic]))
+                j.core.read_namespaced_pod_log.return_value = 'checkpoint saved\n'+diagnostic+'\n'
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(cli, '_job_for', return_value=j), \
+                        mock.patch('sys.stdout', out), mock.patch('sys.stderr', err):
+                    self.assertEqual(cli.cmd_logs(argparse.Namespace(name=j.spec.name, follow=follow)), 0)
+                self.assertEqual(out.getvalue(), 'checkpoint saved\n')
+                self.assertIn(diagnostic, err.getvalue())
 
     def test_log_error_accounting_is_bound_to_run_not_reused_name(self):
         with tempfile.TemporaryDirectory() as d:
