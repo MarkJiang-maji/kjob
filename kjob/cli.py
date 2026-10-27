@@ -38,6 +38,7 @@ from kubernetes.config import ConfigException
 from urllib3.exceptions import HTTPError
 
 from . import cluster, core
+from ._output import decode_pod_output
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 
@@ -545,6 +546,9 @@ def cmd_logs(a) -> int:
             if j.wait_for_pod(report=report) in ("Deleted", "Invalid"):   # still pending: wait instead of failing
                 raise ApiException(status=404)
             for line in j.stream_logs():
+                if re.match(r"\[kjob [^\]]*\] display ", line):
+                    report(line)
+                    continue
                 if j.is_evicted_log_error(line):
                     report(f"kjob: {a.name} log stream unavailable after eviction: {line}")
                     continue
@@ -555,6 +559,7 @@ def cmd_logs(a) -> int:
                 report(f"kjob: {a.name} has not started yet (Pending); kshow {a.name} shows why, klogs -f waits")
                 return 0
             text = j.core.read_namespaced_pod_log(j.pod_name, j.ns, container="pytorch")
+            text = decode_pod_output(text, pod)
             for line in text.splitlines(keepends=True):
                 if j.is_evicted_log_error(line):
                     report(f"kjob: {a.name} log stream unavailable after eviction: {line.rstrip()}")

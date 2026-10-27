@@ -9,7 +9,6 @@ ReadWriteOnce claims that are backed by NFS are mounted as the underlying NFS ex
 from __future__ import annotations
 
 import datetime as _dt
-import codecs
 import copy
 import json
 import os
@@ -29,6 +28,7 @@ from kubernetes.client.rest import ApiException
 from kubernetes.utils.quantity import parse_quantity
 
 from . import cluster
+from ._output import DISPLAY_PROGRAM, frame_prefix, pod_output_chunks
 
 GROUP, VERSION, PLURAL = "kubeflow.org", "v1", "pytorchjobs"
 MANAGED_BY = "kjob"
@@ -184,15 +184,9 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
     q, ts = shlex.quote, "$(date -u +%FT%TZ)"
     run = f" run {run_id}" if run_id else ""      # on every [kjob] line: runs sharing a log file stay apart
     result = '{"kjob":1,"run_id":' + json.dumps(run_id) + ',"log_saved":%s,"script_exit_code":%s}\\n'
-    # Container runtimes may hold partial lines until LF. Convert only the Pod
-    # display stream, after tee has saved the original bytes to shared storage.
-    display = ("import os\ncr = False\nwhile True:\n"
-               " data = os.read(0, 65536)\n"
-               " if not data: break\n"
-               " if cr and data.startswith(b'\\n'): data = data[1:]\n"
-               " cr = data.endswith(b'\\r')\n"
-               " data = data.replace(b'\\r\\n', b'\\r').replace(b'\\r', b'\\r\\n')\n"
-               " while data: data = data[os.write(1, data):]\n")
+    # Frame only the Pod stream; tee saves the original bytes. JSON escaping
+    # keeps user CR, LF and literal protocol-looking text distinct from framing.
+    display = f'-u -c {q(DISPLAY_PROGRAM)} {q(frame_prefix(run_id))}'
     return (
         "set -o pipefail\n"
         f"log={q(log)}\n"
@@ -205,6 +199,16 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
         f'cd {q(workdir)} || {{ echo "[kjob {ts}] cannot enter the working directory "{q(workdir)} | tee -a "$log"; '
         'if [ "$?" -eq 0 ]; then write_result true null; else write_result false null; fi; exit 1; }\n'
         'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
+        'display_output() {\n'
+        'display_python=\n'
+        f'for candidate in {q(sys.executable)} python3 python; do\n'
+        f'  if "$candidate" {display} </dev/null >/dev/null 2>&1; then display_python="$candidate"; break; fi\n'
+        'done\n'
+        '  if [ -n "$display_python" ]; then\n'
+        f'    "$display_python" {display} || {{ '
+        f'echo; echo "[kjob {ts}] display formatter failed; continuing with plain output; the saved log is unchanged{run}"; cat; }}\n'
+        f'  else echo "[kjob {ts}] display Python unavailable; using plain output; progress may be delayed{run}"; cat; fi\n'
+        '}\n'
         f"trap 'echo \"[kjob {ts}] stopping: SIGTERM received{run}\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
         f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE{run}"\n'
@@ -212,12 +216,13 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
         f"  if command -v setsid >/dev/null 2>&1; then (trap - INT QUIT; exec setsid {command}) &\n"
         f"  else (trap - INT QUIT; exec {command}) & fi\n"
         '  echo $! > "$state.pid"; wait $!; rc=$?\n'
-        f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 | tee -a "$log" '
-        f'| {q(sys.executable)} -u -c {q(display)} &\n'
-        "tee_pid=$!\n"
+        f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 '
+        '| { tee -a "$log"; echo $? > "$state.tee"; } | display_output &\n'
+        "pipeline_pid=$!\n"
         # Always reap the pipeline, even if a very short job finished before this shell got here.
         # A TERM trap can interrupt wait; wait again while the pipeline is still alive.
-        "while :; do wait $tee_pid; tee_rc=$?; kill -0 $tee_pid 2>/dev/null || break; done\n"
+        "while :; do wait $pipeline_pid; kill -0 $pipeline_pid 2>/dev/null || break; done\n"
+        'tee_rc=$(cat "$state.tee" 2>/dev/null || echo 1)\n'
         'rc=$(cat "$state.rc" 2>/dev/null || echo 1)\n'
         'if [ "$tee_rc" -ne 0 ]; then\n'
         '  write_result false "$rc"\n'
@@ -225,7 +230,7 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
         f'  echo "[kjob {ts}] log write failed: $log; recover the pod log with klogs {name}{run}"\n'
         f'  echo "[kjob {ts}] exit code $rc{run}"\n'
         'else write_result true "$rc"; fi\n'
-        'rm -f "$state.pid" "$state.rc"\n'
+        'rm -f "$state.pid" "$state.rc" "$state.tee"\n'
         'exit "$rc"\n')
 
 
@@ -487,7 +492,7 @@ class KJob:
                                     # (runPolicy.activeDeadlineSeconds is only checked when the operator reconciles).
                                     active_deadline_seconds=s.time_limit)
         template = client.V1PodTemplateSpec(
-            metadata=client.V1ObjectMeta(annotations={"sidecar.istio.io/inject": "false"},
+            metadata=client.V1ObjectMeta(annotations={"sidecar.istio.io/inject": "false", "kjob/log-stream": self.run_id},
                                          labels={**t.job_labels, "app.kubernetes.io/managed-by": MANAGED_BY}),
             spec=pod_spec)
         api = client.ApiClient()
@@ -645,24 +650,19 @@ class KJob:
 
     def stream_logs(self) -> Iterator[str]:
         """Yield lines and carriage-return updates until the container exits."""
-        self._pod()
+        pod = self._pod()
         resp = self.core.read_namespaced_pod_log(self.pod_name, self.ns, container="pytorch", follow=True,
                                                  _preload_content=False)
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         buf = ""
         progress = False
         try:
-            # read1 returns available bytes even inside a slowly written HTTP chunk.
-            # Older urllib3 releases need byte reads to avoid waiting for a full buffer.
-            chunks = (iter(lambda: resp.read1(1024), b"") if hasattr(type(resp), "read1")
-                      else resp.stream(1))
-            for chunk in chunks:
-                buf += decoder.decode(chunk)
+            for chunk in pod_output_chunks(resp, pod):
+                buf += chunk
                 while "\n" in buf or "\r" in buf or len(buf) >= LOG_FRAGMENT_CHARS:
                     ends = [i for i in (buf.find("\n"), buf.find("\r")) if i >= 0]
                     end = min(ends) if ends else -1
                     if end < 0 or end > LOG_FRAGMENT_CHARS:
-                        yield buf[:LOG_FRAGMENT_CHARS]
+                        yield LogFragment(buf[:LOG_FRAGMENT_CHARS])
                         buf = buf[LOG_FRAGMENT_CHARS:]
                     else:
                         progress = buf[end] == "\r"
@@ -673,7 +673,6 @@ class KJob:
                 if progress and buf:
                     yield LogFragment(buf)
                     buf = ""
-            buf += decoder.decode(b"", final=True)
             if buf:
                 yield buf
         finally:
@@ -774,6 +773,9 @@ class KJob:
             try:
                 report(f"kjob: {self.spec.name} running on {self._pod().spec.node_name}")
                 for line in self.stream_logs():
+                    if re.match(r"\[kjob [^\]]*\] display ", line):
+                        report(line)
+                        continue
                     if self.is_evicted_log_error(line):
                         report(f"kjob: {self.spec.name} log stream unavailable after eviction: {line}")
                         continue

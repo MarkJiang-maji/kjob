@@ -16,6 +16,7 @@ from unittest import mock
 from kubernetes import client
 import urllib3
 from kjob import cli, cluster, core
+from kjob._output import decode_pod_output
 from test_audit_fixes import fixture
 from test_regressions import handle, pod, load_template, manifest_from
 from test_kjob import pod_spec
@@ -31,7 +32,9 @@ class LogStorageTests(unittest.TestCase):
                                env={**os.environ,'TMPDIR':d})
             self.assertEqual(p.returncode, 0)
             self.assertIn(b'\r10%\r20%\r\ncomplete\n', log.read_bytes())
-            self.assertIn(b'\r\n10%\r\n20%\r\ncomplete\n', p.stdout)
+            pmeta = pod()
+            pmeta.metadata.annotations = {'kjob/log-stream': 'abc123'}
+            self.assertIn('\r10%\r20%\r\ncomplete\n', decode_pod_output(p.stdout.decode(), pmeta))
 
     def shell(self, directory, log, command):
         term = Path(directory) / 'termination.json'
