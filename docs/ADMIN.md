@@ -88,7 +88,7 @@ kubectl delete -f deploy/cluster-status.yaml           # 完整移除
 | 方式 | 做法 |
 |---|---|
 | GitHub（預設） | 使用者執行 README 的安裝指令，裝在自己的 `~/.local` |
-| wheel | `python3 -m pip wheel --no-deps -w dist .`，把 `dist/kjob-0.4.0-py3-none-any.whl` 給使用者，`pip install --user` 安裝 |
+| wheel | `python3 -m pip wheel --no-deps -w dist .`，把 `dist/kjob-0.5.0-py3-none-any.whl` 給使用者，`pip install --user` 安裝 |
 | 預裝在 Notebook image | `deploy/Dockerfile`：`docker build --build-arg BASE_IMAGE=<image> --build-arg NOTEBOOK_USER=<原本的 USER> -f deploy/Dockerfile dist/` |
 
 ## 5. 會建立的 Kubernetes 物件

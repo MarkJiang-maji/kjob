@@ -95,7 +95,7 @@ When your tool blocked the command:
 |---|---|---|
 | `-J, --job-name` | script name + suffix | job name (lowercase letters, digits, `-`) |
 | `-G, --gpus` | 1 | GPUs; `0` = CPU-only |
-| `-g, --gpu-type` | any | short name (`v100`, `a5000`, `a30`, `a30-shared`), a GPU_TYPE from `ksinfo` or an unambiguous part of it (case-insensitive), a node name, or a raw product label; comma list = any of them. Ambiguous or unknown names are rejected |
+| `-g, --gpu-type` | any | short name (`v100`, `a5000`; `kinfo` lists the ones this cluster has, never suggest a type `ksinfo` does not show), a GPU_TYPE from `ksinfo` or an unambiguous part of it (case-insensitive), a node name, or a raw product label; comma list = any of them. Ambiguous or unknown names are rejected |
 | `-w, --nodelist` / `-x, --exclude` | - | run on / avoid specific nodes |
 | `-c, --cpus` | 1 | CPU cores |
 | `--mem` | 2Gi | memory (Kubernetes units: `32Gi`) |
@@ -106,6 +106,7 @@ When your tool blocked the command:
 | `-D, --chdir` | current dir | working directory |
 | `-o, --log-dir` | `~/kjob-logs` | where the output log is written |
 | `--ttl` | 3600 | seconds a finished, unwatched job object is kept |
+| `--live-progress` | off | show `\r` progress bars (tqdm) at once in ksrun/kwait/klogs; the pod log is then framed and reads badly in kubectl logs / the Kubeflow UI. Off: plain pod log, progress may appear only at the next newline |
 
 Script files may also carry options at the top (before the first command): `#KJOB -G 2 -g v100 --mem 64Gi` or
 Slurm-style `#SBATCH --gres=gpu:v100:2 --mem=64G -t 1-00:00:00 -c 8 -J name`. Unsupported `#SBATCH` options

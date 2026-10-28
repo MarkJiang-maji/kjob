@@ -27,7 +27,7 @@ class LogStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             log, term = Path(d)/'job.log', Path(d)/'termination.json'
             command = "bash -c 'printf \"\\r10%%\\r20%%\\r\\ncomplete\\n\"'"
-            shell = core.job_shell('test', command, d, str(log), 'abc123', str(term))
+            shell = core.job_shell('test', command, d, str(log), 'abc123', str(term), live_progress=True)
             p = subprocess.run(['bash','-c',shell], capture_output=True, timeout=10,
                                env={**os.environ,'TMPDIR':d})
             self.assertEqual(p.returncode, 0)
@@ -279,7 +279,8 @@ class MonitoringTests(unittest.TestCase):
                 j.core.read_namespaced_pod.return_value.status.reason = reason
                 j.stream_logs = mock.Mock(return_value=iter(['saved checkpoint', diagnostic]))
                 out, messages = io.StringIO(), []
-                self.assertEqual(j.follow(out=out, report=messages.append), 143)
+                with mock.patch.object(core, 'EVICTION_GRACE_SECONDS', 0):
+                    self.assertEqual(j.follow(out=out, report=messages.append), 143)
                 self.assertIn('saved checkpoint', out.getvalue())
                 if reason:
                     self.assertNotIn('rpc error:', out.getvalue())
@@ -287,6 +288,29 @@ class MonitoringTests(unittest.TestCase):
                     self.assertIn('Evicted', messages[-1])
                 else:
                     self.assertIn(diagnostic, out.getvalue())
+
+    def test_diagnostic_is_filtered_when_the_evicted_reason_arrives_after_it(self):
+        # Seen on a live cluster: Docker's message ends the stream in the same second kubelet evicts the Pod,
+        # before the Pod's status says Evicted.
+        diagnostic = 'rpc error: code = Unknown desc = Error response from daemon: No such container: example'
+        j = self.finished(code=137, log_saved=True)
+        status = j.core.read_namespaced_pod.return_value.status
+        status.reason = None
+        j.stream_logs = mock.Mock(return_value=iter(['dd finished', diagnostic]))
+        out, messages = io.StringIO(), []
+        with mock.patch.object(core.time, 'sleep', lambda _: setattr(status, 'reason', 'Evicted')):
+            self.assertEqual(j.follow(out=out, report=messages.append), 137)
+        self.assertEqual(out.getvalue(), 'dd finished\n')
+        self.assertTrue(any('log stream unavailable after eviction' in m and diagnostic in m for m in messages))
+
+    def test_diagnostic_followed_by_more_output_is_the_scripts_own(self):
+        diagnostic = 'rpc error: code = Unknown desc = Error response from daemon: No such container: example'
+        j = self.finished(code=0, log_saved=True)
+        j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+        j.stream_logs = mock.Mock(return_value=iter(['a', diagnostic, 'b']))
+        out = io.StringIO()
+        j.follow(out=out, report=lambda _: None)
+        self.assertEqual(out.getvalue(), f'a\n{diagnostic}\nb\n')
 
     def test_klogs_keeps_eviction_diagnostics_separate_from_output(self):
         diagnostic = 'rpc error: code = Unknown desc = Error response from daemon: No such container: example'
@@ -316,8 +340,25 @@ class MonitoringTests(unittest.TestCase):
                     self.assertTrue(any('log stream unavailable after eviction' in m for m in messages))
         j = self.finished(code=143, log_saved=True)
         j.stream_logs = mock.Mock(side_effect=core.ApiException(status=400))
-        with self.assertRaises(core.ApiException):
+        with self.assertRaises(core.ApiException), mock.patch.object(core, 'EVICTION_GRACE_SECONDS', 0):
             j.follow(out=io.StringIO(), report=lambda _: None)
+
+    def test_log_request_refused_before_the_evicted_reason_arrives(self):
+        j = self.finished(code=137, log_saved=True)
+        status = j.core.read_namespaced_pod.return_value.status
+        status.reason = None
+        j.stream_logs = mock.Mock(side_effect=core.ApiException(status=400))
+        messages = []
+        with mock.patch.object(core.time, 'sleep', lambda _: setattr(status, 'reason', 'Evicted')):
+            self.assertEqual(j.follow(out=io.StringIO(), report=messages.append), 137)
+        self.assertTrue(any('log stream unavailable after eviction' in m for m in messages))
+        self.assertIn('Evicted', messages[-1])
+
+    def test_no_wait_for_an_evicted_reason_when_the_pod_has_not_started(self):
+        j = self.finished(code=137, log_saved=True)
+        j.core.read_namespaced_pod.return_value.status.phase = 'Pending'
+        with mock.patch.object(core.time, 'sleep', side_effect=AssertionError('waited')):
+            self.assertFalse(j.is_evicted_log_exception(core.ApiException(status=400)))
 
     def test_klogs_recovers_saved_bytes_when_evicted_container_is_gone(self):
         for follow in (False, True):
@@ -358,6 +399,83 @@ class MonitoringTests(unittest.TestCase):
                 cli.cmd_acct(argparse.Namespace(n=0))
             rows = out.getvalue().splitlines()[1:]
             self.assertEqual([row.split()[5:7] for row in rows], [['LOG_ERROR', '74'], ['COMPLETED', '0']])
+
+    def test_eviction_is_accounted_after_the_job_is_deleted(self):
+        # The log alone reads like -t or kcancel (a SIGTERM line, then the script's 143).
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'sc.log'
+            log.write_text('[kjob 2026-01-01T00:00:01Z] start sc on node n run aaa\n'
+                           '[kjob 2026-01-01T00:00:30Z] stopping: SIGTERM received run aaa\n'
+                           '[kjob 2026-01-01T00:00:30Z] exit code 143 run aaa\n')
+            history = [{'name': 'sc', 'submitted': '2026-01-01T00:00:00Z', 'log': str(log), 'gpus': 0, 'run_id': 'aaa'}]
+            events = [{'event': 'evicted', 'name': 'sc', 'run_id': 'aaa', 'exit_code': 137}]
+            out = io.StringIO()
+            with mock.patch.object(core, 'read_history', return_value=history), \
+                    mock.patch.object(core, 'read_events', return_value=events), \
+                    mock.patch.object(core, 'list_jobs', return_value=[]), mock.patch('sys.stdout', out):
+                cli.cmd_acct(argparse.Namespace(n=0))
+            self.assertEqual(out.getvalue().splitlines()[1].split()[5:7], ['EVICTED', '137'])
+
+    def running_then(self, j, *later):
+        """Pod reads: the script's container still runs, then each status in `later`."""
+        running = pod()
+        running.status.container_statuses = [client.V1ContainerStatus(
+            name='pytorch', image='test', image_id='test', ready=True, restart_count=0,
+            state=client.V1ContainerState(running=client.V1ContainerStateRunning()))]
+        finished = j.core.read_namespaced_pod.return_value
+        j.core.read_namespaced_pod.side_effect = [running, running, *later] + [finished] * 20
+
+    def test_stream_ended_while_the_script_runs_is_followed_again(self):
+        # kubelet closes a stream idle for hours; the API server restarts. ksrun must not report 1 for a running job.
+        for cut in ('ended', 'reset'):
+            with self.subTest(cut=cut):
+                j = self.finished(code=0, log_saved=True, state='Succeeded')
+                self.running_then(j)
+                def first():
+                    yield 'epoch 1'
+                    if cut == 'reset':
+                        raise urllib3.exceptions.ProtocolError('Connection broken')
+                j.stream_logs = mock.Mock(side_effect=[first(), iter(['epoch 2', '[kjob now] exit code 0 run abc123'])])
+                out, messages = io.StringIO(), []
+                self.assertEqual(j.follow(out=out, report=messages.append), 0)
+                self.assertEqual(out.getvalue(), 'epoch 1\nepoch 2\n')
+                self.assertEqual(j.stream_logs.call_count, 2)
+                self.assertGreaterEqual(j.stream_logs.call_args_list[1].kwargs['since_seconds'], 1)
+                self.assertTrue(any('following again' in m for m in messages))
+
+    def test_no_second_follow_once_the_script_has_ended(self):
+        for lines in (['done', '[kjob now] exit code 0 run abc123'], ['killed: no exit line']):
+            with self.subTest(lines=lines):
+                j = self.finished(code=0, log_saved=True, state='Succeeded')
+                j.stream_logs = mock.Mock(return_value=iter(lines))   # the pod's container has terminated
+                self.assertEqual(j.follow(out=io.StringIO(), report=lambda _: None), 0)
+                j.stream_logs.assert_called_once()
+
+    def test_kwait_records_an_eviction_killed_before_the_wrapper_reported(self):
+        # Kubelet SIGKILLs an evicted container (exit 137): no termination message carries the run id, so kwait,
+        # which starts from the name only, takes it from the CR.
+        j = self.finished(code=137, log_saved=True)
+        del j.run_id, j.state                       # as cli._job_for builds it
+        j.core.read_namespaced_pod.return_value.status.container_statuses[0].state.terminated.message = None
+        j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+        j.custom.get_namespaced_custom_object.return_value = {
+            'metadata': {'uid': 'old', 'annotations': {'kjob/run-id': 'abc123'}}}
+        j.stream_logs = mock.Mock(return_value=iter([]))
+        with mock.patch.object(core, 'job_state', return_value='Failed'), \
+                mock.patch.object(core, 'record_event') as rec:
+            self.assertEqual(j.follow(out=io.StringIO(), report=lambda _: None), 137)
+        rec.assert_called_once_with('evicted', j.spec.name, run_id='abc123', exit_code=137)
+
+    def test_follow_records_the_eviction_for_kacct(self):
+        # The recorded code is the one ksrun/kwait return: an evicted script that exited 0 still failed.
+        for code, final in ((137, 137), (0, 1)):
+            with self.subTest(code=code):
+                j = self.finished(code=code, log_saved=True)
+                j.core.read_namespaced_pod.return_value.status.reason = 'Evicted'
+                j.stream_logs = mock.Mock(return_value=iter([]))
+                with mock.patch.object(core, 'record_event') as rec:
+                    self.assertEqual(j.follow(out=io.StringIO(), report=lambda _: None), final)
+                rec.assert_called_once_with('evicted', j.spec.name, run_id=j.run_id, exit_code=final)
 
     def accounting_result(self, j, state='Running'):
         obj = {'metadata': {'name': j.spec.name, 'uid': 'old', 'annotations': {'kjob/run-id': 'abc123'}}}
@@ -427,3 +545,62 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(volumes['ram-scratch']['emptyDir']['sizeLimit'], '128Mi')
         self.assertEqual(volumes['disk-scratch']['emptyDir']['sizeLimit'], '500Mi')
         self.assertEqual(volumes['shm']['emptyDir']['sizeLimit'], '8Gi')
+
+
+class KinfoTests(unittest.TestCase):
+    def kinfo(self, snapshot):
+        t = mock.Mock(volumes=[], volume_mounts=[], skipped={}, poddefaults_known=True)
+        out = io.StringIO()
+        with mock.patch.object(core.NotebookTemplate, 'from_current_pod', return_value=t), \
+                mock.patch.object(core, 'quota', return_value=[]), \
+                mock.patch.object(cluster, 'load_snapshot', **snapshot), mock.patch('sys.stdout', out):
+            cli.cmd_info(argparse.Namespace())
+        return out.getvalue()
+
+    def test_short_names_are_only_those_this_cluster_has(self):
+        text = self.kinfo({'return_value': {'nodes': [{'product': 'Tesla-V100-SXM2-16GB'}, {'product': 'NVIDIA-RTX-A5000'}]}})
+        self.assertIn('v100=Tesla-V100-SXM2-16GB', text)
+        self.assertIn('a5000=NVIDIA-RTX-A5000', text)
+        self.assertNotIn('a30', text)
+
+    def test_all_short_names_when_the_cluster_view_is_unavailable(self):
+        text = self.kinfo({'side_effect': cluster.ClusterViewUnavailable('no access')})
+        self.assertIn('a30=NVIDIA-A30', text)
+
+
+class PlainPodLogTests(unittest.TestCase):
+    """The default pod log stays plain text for kubectl logs, the Kubeflow UI and older kjob; framing is opt-in."""
+
+    def run_wrapper(self, d, **kw):
+        command = "bash -c 'printf \"hello\\n\\r10%%\\r100%%\\n\"'"
+        shell = core.job_shell('test', command, d, str(Path(d)/'job.log'), 'abc123', str(Path(d)/'term'), **kw)
+        return subprocess.run(['bash', '-c', shell], capture_output=True, timeout=10, env={**os.environ, 'TMPDIR': d})
+
+    def test_default_pod_log_is_the_scripts_own_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.run_wrapper(d)
+            self.assertEqual(p.returncode, 0)
+            self.assertNotIn(b'[kjob-output:', p.stdout)
+            self.assertIn(b'\nhello\n\r10%\r100%\n[kjob ', p.stdout)
+            self.assertEqual(p.stdout, (Path(d)/'job.log').read_bytes())
+
+    def test_live_progress_frames_the_pod_log_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.run_wrapper(d, live_progress=True)
+            self.assertIn(b'[kjob-output:abc123] ', p.stdout)
+            self.assertIn(b'hello\n\r10%\r100%\n', (Path(d)/'job.log').read_bytes())
+
+    def annotations(self, **kw):
+        return manifest_from(load_template(fixture()), **kw)['spec']['pytorchReplicaSpecs']['Master']['template'] \
+            ['metadata']['annotations']
+
+    def test_only_live_progress_jobs_announce_a_framed_log(self):
+        self.assertNotIn('kjob/log-stream', self.annotations())
+        self.assertIn('kjob/log-stream', self.annotations(live_progress=True))
+
+    def test_live_progress_option(self):
+        with mock.patch.object(cli, 'resolve_gpu_types', return_value=([], None)), \
+                mock.patch.object(cli, '_check_access'):
+            for extra, expected in (([], False), (['--live-progress'], True)):
+                a = cli.build_parser().parse_args(['submit', '-G', '0'] + extra + ['x.py'])
+                self.assertIs(cli._spec(a).live_progress, expected)

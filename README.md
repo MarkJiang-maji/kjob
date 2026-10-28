@@ -8,8 +8,8 @@
 * **自動收尾**：輸出即時顯示並存到 `~/kjob-logs/工作名稱.log`；`ksrun` 結束就刪除工作，`ksub` 在 `--ttl` 秒後
   自動刪除；`-t` 時間到先送 SIGTERM，程式有 30 秒存檔。
   日誌保存失敗時，`ksrun`／`kwait` 會回報錯誤並保留已結束的 Pod，可用 `klogs` 取回輸出；原有 `--ttl` 仍適用。
-  進度條原地更新，日誌檔保留原始輸出；顯示工具不可用時會提示並退回普通輸出。
-  Pod log 使用傳輸標記，請以新版 `klogs` 讀取；保存的日誌檔不受影響。
+  Pod log 是一般文字，`kubectl logs`、Kubeflow UI 都能直接看；tqdm 這類只用 `\r` 更新的進度條可能要到換行才出現，
+  要即時原地更新請加 `--live-progress`（這時 Pod log 改用傳輸標記，只有 kjob 讀得好看；保存的日誌檔不受影響）。
 
 ## 安裝（在 Notebook 的 Terminal）
 
@@ -71,6 +71,7 @@ kacct                     # 自己提交過的工作、結束代碼、執行時�
 | `--env KEY=VALUE` | — | 額外環境變數，可重複 |
 | `-D, --chdir` / `-o, --log-dir` | 目前目錄 / `~/kjob-logs` | 工作目錄／日誌位置 |
 | `--ttl` | 3600 | 結束且沒人監看的工作保留幾秒 |
+| `--live-progress` | 關 | 進度條（`\r` 更新）即時原地顯示；Pod log 改用傳輸標記，`kubectl logs`／Kubeflow UI 會看到標記格式 |
 
 `.py` 用 Python 執行、`.sh` 用 bash，其他直接執行。選項也可以寫在腳本開頭的 `#SBATCH` 或 `#KJOB` 行。
 

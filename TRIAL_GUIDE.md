@@ -101,7 +101,7 @@ kjob: train-1a2b3c4d5e6f Succeeded (exit code 0)
 ```
 
 想指定 GPU 型號就在指令加 `-g`，例如 `ksrun -g v100 ~/kjob-demo/train.sh`；名稱用 `ksinfo` 裡看到的
-（例如 `a5000`、`a30`、`rtxpro6000`）。命令列的選項比檔案開頭的設定優先。
+（例如 `v100`、`a5000`、`rtxpro6000`）。命令列的選項比檔案開頭的設定優先。
 `ksrun` 結束後會自動刪除工作；按 Ctrl-C 會取消工作。
 
 ## 5. 背景提交：`ksub`
@@ -166,7 +166,7 @@ PY
 cat > train_ddp.sh <<'SH'
 #!/bin/bash
 #SBATCH --gres=gpu:2                # GPU 張數（任何型號）
-##SBATCH --gres=gpu:v100:2          # 指定型號：拿掉一個 #；型號名稱看 ksinfo（例如 a5000、a30）
+##SBATCH --gres=gpu:v100:2          # 指定型號：拿掉一個 #；型號名稱看 ksinfo（例如 v100、a5000）
 ##SBATCH -w node-01                 # 指定節點：拿掉一個 #；節點名稱看 ksinfo
 #SBATCH -c 4                        # CPU 核心
 #SBATCH --mem=16G                   # 記憶體

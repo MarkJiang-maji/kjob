@@ -49,7 +49,7 @@ export PATH="$HOME/.local/bin:$PATH"
 | 有 git，想用 git 安裝 | `python3 -m pip install --user --upgrade 'git+https://github.com/MarkJiang-maji/kjob.git@main'` |
 | 固定某個版本 | 把網址中的 `refs/heads/main` 換成 commit SHA：`.../archive/<sha>.tar.gz` |
 | 虛擬環境內 | 啟用環境後執行 `python -m pip install --upgrade ...`（不加 `--user`） |
-| 沒有網路，用管理員給的 wheel | `python3 -m pip install --user kjob-0.4.0-py3-none-any.whl` |
+| 沒有網路，用管理員給的 wheel | `python3 -m pip install --user kjob-0.5.0-py3-none-any.whl` |
 | 從原始碼開發 | `git clone ...; python3 -m pip install --user -e kjob` |
 | 移除 | `python3 -m pip uninstall kjob` |
 
@@ -79,6 +79,7 @@ ksrun [選項] 腳本 [腳本參數...]     提交、即時輸出、結束後刪
 | `-D, --chdir DIR` | 目前目錄 | 工作的工作目錄 |
 | `-o, --log-dir DIR` | `~/kjob-logs` | 日誌存放處，必須在可寫入的共用磁碟 |
 | `--ttl SECONDS` | `3600` | 工作結束且沒人監看時，工作物件保留多久才自動刪除 |
+| `--live-progress` | 關 | tqdm 這類只用 `\r` 更新的進度條即時原地顯示。預設不開：Pod log 保持一般文字，`kubectl logs`、Kubeflow UI 可直接閱讀，但進度條可能要到換行才出現。開啟後 Pod log 改用 `[kjob-output:...]` 傳輸標記，請用 `ksrun`／`kwait`／`klogs` 看；`~/kjob-logs` 的日誌檔一律是原始輸出 |
 
 腳本類型：`.py` 用 Python 執行，`.sh` 用 bash，其他檔案直接執行（需要執行權限）；也可以直接給 image 裡的指令，
 例如 `ksrun -G 1 nvidia-smi`。腳本名稱之後的所有參數都交給腳本：`ksub -G 1 train.py -c config.yaml` 的 `-c` 是給
@@ -241,7 +242,7 @@ GPU_TYPE（排隊中的顯示它要求的型號，沒指定則為 `any`）、NOD
 
 `-g` 可以用：
 
-1. 簡稱（不分大小寫）：`v100`、`a5000`、`a30`（整張）、`a30-shared`（MPS 共享）。
+1. 簡稱（不分大小寫）：`v100`、`a5000`；有 A30 的叢集另有 `a30`（整張）、`a30-shared`（MPS 共享）。`kinfo` 只列出這個叢集有的簡稱。
 2. `ksinfo` GPU_TYPE 欄的名稱，不分大小寫、可省略符號：`Tesla-V100-SXM2-16GB`、`rtx-a5000`。也可以只寫其中一段，
    但必須只對應到一種型號：`v100-sxm2`、`a5000`、`rtxpro6000`、`blackwell` 可以；`rtx` 同時符合 `NVIDIA-RTX-A5000`
    與 `NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition` 會報錯，請寫清楚或用逗號列出。找不到的名稱直接報錯，不會提交。

@@ -26,6 +26,7 @@ from typing import Iterator
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 from kubernetes.utils.quantity import parse_quantity
+from urllib3.exceptions import HTTPError
 
 from . import cluster
 from ._output import DISPLAY_PROGRAM, frame_prefix, pod_output_chunks
@@ -52,6 +53,10 @@ DEFAULT_CPUS, DEFAULT_MEMORY = 1, "2Gi"
 DEFAULT_SHM = None   # /dev/shm limit = --mem: only a cap (its use counts toward memory), big enough for DataLoader workers
 STATUS_GRACE_SECONDS = 30  # after the log stream ends, do not wait forever for an operator update
 LOG_FRAGMENT_CHARS = 64 * 1024  # progress output may never contain a newline
+EVICTION_GRACE_SECONDS = 10  # how long to wait for an Evicted reason after the runtime diagnostic
+RECONNECT_SECONDS = 3  # before following again a log stream that ended while the script still runs
+# Docker's message when the log stream outlives an evicted container
+RUNTIME_GONE = re.compile(r"^rpc error: code = (?:Unknown|NotFound) desc = .*No such container\b")
 
 
 class LogFragment(str):
@@ -177,10 +182,13 @@ def _own_container_refs(e: client.V1EnvVar, notebook_container: str) -> client.V
 
 
 def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
-              termination_log: str = "/dev/termination-log") -> str:
+              termination_log: str = "/dev/termination-log", live_progress: bool = False) -> str:
     """Container command. Output goes to the pod log and to the log file. The script runs in its own process group
     and gets the SIGTERM sent at the -t limit or by kcancel, so it can save state within the grace period
-    (bash as PID 1 would otherwise ignore SIGTERM and everything is killed 30 s later)."""
+    (bash as PID 1 would otherwise ignore SIGTERM and everything is killed 30 s later).
+
+    The pod log is plain text unless live_progress: then it is framed (see _output) so that CR progress updates
+    reach ksrun/kwait at once, at the cost of a pod log that only kjob reads well."""
     q, ts = shlex.quote, "$(date -u +%FT%TZ)"
     run = f" run {run_id}" if run_id else ""      # on every [kjob] line: runs sharing a log file stay apart
     result = '{"kjob":1,"run_id":' + json.dumps(run_id) + ',"log_saved":%s,"script_exit_code":%s}\\n'
@@ -199,16 +207,16 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
         f'cd {q(workdir)} || {{ echo "[kjob {ts}] cannot enter the working directory "{q(workdir)} | tee -a "$log"; '
         'if [ "$?" -eq 0 ]; then write_result true null; else write_result false null; fi; exit 1; }\n'
         'state="${TMPDIR:-/tmp}/kjob-$HOSTNAME-$$"\n'
-        'display_output() {\n'
-        'display_python=\n'
-        f'for candidate in {q(sys.executable)} python3 python; do\n'
-        f'  if "$candidate" {display} </dev/null >/dev/null 2>&1; then display_python="$candidate"; break; fi\n'
-        'done\n'
-        '  if [ -n "$display_python" ]; then\n'
-        f'    "$display_python" {display} || {{ '
-        f'echo; echo "[kjob {ts}] display formatter failed; continuing with plain output; the saved log is unchanged{run}"; cat; }}\n'
-        f'  else echo "[kjob {ts}] display Python unavailable; using plain output; progress may be delayed{run}"; cat; fi\n'
-        '}\n'
+        + ('display_output() {\n'
+           'display_python=\n'
+           f'for candidate in {q(sys.executable)} python3 python; do\n'
+           f'  if "$candidate" {display} </dev/null >/dev/null 2>&1; then display_python="$candidate"; break; fi\n'
+           'done\n'
+           '  if [ -n "$display_python" ]; then\n'
+           f'    "$display_python" {display} || {{ '
+           f'echo; echo "[kjob {ts}] display formatter failed; continuing with plain output; the saved log is unchanged{run}"; cat; }}\n'
+           f'  else echo "[kjob {ts}] display Python unavailable; using plain output; progress may be delayed{run}"; cat; fi\n'
+           '}\n' if live_progress else "") +
         f"trap 'echo \"[kjob {ts}] stopping: SIGTERM received{run}\" | tee -a \"$log\"; "
         'p=$(cat "$state.pid" 2>/dev/null); [ -n "$p" ] && { kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p"; }\' TERM INT\n'
         f'{{ echo "[kjob {ts}] start {name} on node $KJOB_NODE{run}"\n'
@@ -217,7 +225,7 @@ def job_shell(name: str, command: str, workdir: str, log: str, run_id: str = "",
         f"  else (trap - INT QUIT; exec {command}) & fi\n"
         '  echo $! > "$state.pid"; wait $!; rc=$?\n'
         f'  echo "[kjob {ts}] exit code $rc{run}"; echo $rc > "$state.rc"; }} 2>&1 '
-        '| { tee -a "$log"; echo $? > "$state.tee"; } | display_output &\n'
+        '| { tee -a "$log"; echo $? > "$state.tee"; }' + (" | display_output" if live_progress else "") + " &\n"
         "pipeline_pid=$!\n"
         # Always reap the pipeline, even if a very short job finished before this shell got here.
         # A TERM trap can interrupt wait; wait again while the pipeline is still alive.
@@ -364,6 +372,7 @@ class JobSpec:
     log_dir: str = str(Path.home() / "kjob-logs")
     ttl_seconds: int = 3600                              # safety net if nobody monitors the job
     time_limit: int | None = None                        # seconds; the job is stopped after this (like --time)
+    live_progress: bool = False                          # framed pod log: CR progress shows at once (see job_shell)
 
     def validate(self) -> None:
         if not isinstance(self.gpus, int) or self.gpus < 0:
@@ -437,7 +446,7 @@ class KJob:
         s.validate()
         workdir = s.workdir or t.working_dir
         log = s.log_path()
-        shell = job_shell(s.name, s.command(), workdir, log, self.run_id)
+        shell = job_shell(s.name, s.command(), workdir, log, self.run_id, live_progress=s.live_progress)
         res = {"cpu": str(s.cpus), "memory": s.memory}
         if s.gpus:
             res["nvidia.com/gpu"] = str(s.gpus)  # CPU-only jobs must not request GPUs at all
@@ -492,7 +501,9 @@ class KJob:
                                     # (runPolicy.activeDeadlineSeconds is only checked when the operator reconciles).
                                     active_deadline_seconds=s.time_limit)
         template = client.V1PodTemplateSpec(
-            metadata=client.V1ObjectMeta(annotations={"sidecar.istio.io/inject": "false", "kjob/log-stream": self.run_id},
+            # kjob/log-stream tells klogs/kwait that the pod log is framed; plain logs are read as they are
+            metadata=client.V1ObjectMeta(annotations={"sidecar.istio.io/inject": "false",
+                                                      **({"kjob/log-stream": self.run_id} if s.live_progress else {})},
                                          labels={**t.job_labels, "app.kubernetes.io/managed-by": MANAGED_BY}),
             spec=pod_spec)
         api = client.ApiClient()
@@ -594,6 +605,11 @@ class KJob:
             if getattr(self, "uid", uid) != uid:
                 return "Deleted"
             self.uid = uid
+            # kwait starts without the run id. An evicted container is SIGKILLed before the wrapper can report it,
+            # so take it from the CR: kacct matches the evicted/log-error events by it.
+            run_id = (obj["metadata"].get("annotations") or {}).get("kjob/run-id")
+            if run_id and not getattr(self, "run_id", None):
+                self.run_id = run_id
             return job_state(obj)
         except ApiException as e:
             if e.status == 404:
@@ -648,11 +664,12 @@ class KJob:
                 return "Pending"
             time.sleep(3)
 
-    def stream_logs(self) -> Iterator[str]:
-        """Yield lines and carriage-return updates until the container exits."""
+    def stream_logs(self, since_seconds: int | None = None) -> Iterator[str]:
+        """Yield lines and carriage-return updates until the container exits (or the stream is cut)."""
         pod = self._pod()
+        since = {"since_seconds": since_seconds} if since_seconds else {}
         resp = self.core.read_namespaced_pod_log(self.pod_name, self.ns, container="pytorch", follow=True,
-                                                 _preload_content=False)
+                                                 _preload_content=False, **since)
         buf = ""
         progress = False
         try:
@@ -732,13 +749,57 @@ class KJob:
         except ApiException:
             return None
 
-    def is_evicted_log_error(self, line: str) -> bool:
+    def evicted(self, wait: float = 0) -> bool:
+        """Whether the Pod was evicted. Kubelet can set the reason a moment after the log stream ends, so wait up to
+        `wait` seconds, but not for a Pod that is gone or has not started."""
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                status = self._pod().status
+            except ApiException:
+                return False
+            if status.reason == "Evicted":
+                return True
+            if status.phase == "Pending" or time.monotonic() >= deadline:
+                return False
+            time.sleep(1)
+
+    def is_evicted_log_error(self, line: str, wait: float = 0) -> bool:
         """Recognize a missing-runtime-container diagnostic only for an evicted Pod."""
-        return bool(re.match(r"^rpc error: code = (?:Unknown|NotFound) desc = .*No such container\b", line)
-                    and self.stop_reason() == "Evicted")
+        return bool(RUNTIME_GONE.match(line) and self.evicted(wait))
+
+    def main_running(self) -> bool:
+        """Whether the job's own container still runs (its log stream can end before it does)."""
+        try:
+            pod = self._pod()
+        except ApiException:
+            return False
+        return any(cs.name == "pytorch" and cs.state is not None and cs.state.running is not None
+                   for cs in pod.status.container_statuses or [])
+
+    def user_lines(self, report, since_seconds: int | None = None) -> Iterator[str]:
+        """stream_logs() without kjob's display notices and the runtime's after-eviction diagnostic."""
+        held = []
+        for line in self.stream_logs(since_seconds=since_seconds):
+            if re.match(r"\[kjob [^\]]*\] display ", line):
+                report(line)
+                continue
+            if RUNTIME_GONE.match(line):
+                held.append(line)   # decided at the end: the line arrives before the Pod says Evicted
+                continue
+            yield from held         # more output followed, so it was the script's own
+            held = []
+            yield line
+        if held and self.evicted(wait=EVICTION_GRACE_SECONDS):
+            for line in held:
+                report(f"kjob: {self.spec.name} log stream unavailable after eviction: {line}")
+        else:
+            yield from held
 
     def is_evicted_log_exception(self, error: ApiException) -> bool:
-        return error.status in (400, 404) and self.stop_reason() == "Evicted"
+        """A log request refused because the evicted container is gone. On 400 the Pod still exists and its Evicted
+        reason can lag, as for the diagnostic line above; 404 means the Pod is gone, so there is nothing to wait for."""
+        return error.status in (400, 404) and self.evicted(wait=EVICTION_GRACE_SECONDS if error.status == 400 else 0)
 
     def exit_code(self) -> int | None:
         try:
@@ -775,21 +836,33 @@ class KJob:
         if phase != "Deleted":
             try:
                 report(f"kjob: {self.spec.name} running on {self._pod().spec.node_name}")
-                for line in self.stream_logs():
-                    if re.match(r"\[kjob [^\]]*\] display ", line):
-                        report(line)
-                        continue
-                    if self.is_evicted_log_error(line):
-                        report(f"kjob: {self.spec.name} log stream unavailable after eviction: {line}")
-                        continue
-                    m = re.match(r"\[kjob [^\]]*\] exit code (\d+)( run [0-9a-f]+)?$", line)
-                    if m:
-                        last_code = int(m.group(1))
-                    else:
-                        if re.match(r"\[kjob [^\]]*\] log write failed:", line):
-                            self.log_failed = True
-                        print(line, end="" if isinstance(line, LogFragment) or line.endswith("\r") else "\n",
-                              file=out, flush=True)
+                since, last_output = None, time.monotonic()
+                while True:
+                    try:
+                        for line in self.user_lines(report, since_seconds=since):
+                            last_output = time.monotonic()
+                            m = re.match(r"\[kjob [^\]]*\] exit code (\d+)( run [0-9a-f]+)?$", line)
+                            if m:
+                                last_code = int(m.group(1))
+                            else:
+                                if re.match(r"\[kjob [^\]]*\] log write failed:", line):
+                                    self.log_failed = True
+                                print(line, end="" if isinstance(line, LogFragment) or line.endswith("\r") else "\n",
+                                      file=out, flush=True)
+                    except HTTPError:
+                        pass  # connection cut mid-stream: decided below like a stream that ended
+                    if last_code is not None:
+                        break  # the wrapper reported the script's end
+                    # The stream can end while the script runs: kubelet closes idle streams (no output for hours),
+                    # the API server restarts, the network drops. The pause lets a container that just exited show
+                    # as terminated, so its last lines are not printed twice.
+                    time.sleep(RECONNECT_SECONDS)
+                    if not self.main_running():
+                        break
+                    if since is None:
+                        report(f"kjob: {self.spec.name} log stream interrupted while the job runs; following again "
+                               "(the last few lines may repeat)")
+                    since = int(time.monotonic() - last_output) + 1  # covers the gap; at most ~1 s repeats
             except ApiException as e:
                 if self.is_evicted_log_exception(e):
                     report(f"kjob: {self.spec.name} log stream unavailable after eviction; "
@@ -825,8 +898,11 @@ class KJob:
                    f"Exit status 124")
             return code if code not in (None, 0) else 124
         if reason == "Evicted":
+            final = code if code not in (None, 0) else 1    # a script that saved and exited 0 still did not finish
+            # kacct reads this after the job is deleted; the log alone looks like a time limit or kcancel
+            record_event("evicted", self.spec.name, run_id=getattr(self, "run_id", None), exit_code=final)
             report(f"kjob: {self.spec.name} Evicted (script exit code {code})")
-            return code if code not in (None, 0) else 1
+            return final
         detail = f", {reason}" if reason and reason not in ("Completed", "Error") else ""
         report(f"kjob: {self.spec.name} {st} (exit code {code}{detail})")
         return code if code is not None else (0 if st == "Succeeded" else 1)

@@ -18,6 +18,13 @@ def _private_history(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_reconnect_pause(monkeypatch):
+    # Most mocked streams end without the wrapper's exit line, as a killed container's does.
+    from kjob import core
+    monkeypatch.setattr(core, "RECONNECT_SECONDS", 0)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_kubernetes_requests(monkeypatch):
     from kubernetes import client
 

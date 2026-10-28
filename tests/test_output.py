@@ -53,7 +53,7 @@ class OutputTests(unittest.TestCase):
                 log, term = Path(d)/'saved.log', Path(d)/'termination.json'
                 source = Path(d)/'payload'
                 source.write_bytes(payload.encode())
-                shell = core.job_shell('test', 'cat '+shlex.quote(str(source)), d, str(log), 'abc123', str(term))
+                shell = core.job_shell('test', 'cat '+shlex.quote(str(source)), d, str(log), 'abc123', str(term), live_progress=True)
                 p = subprocess.run(['bash', '-c', shell], capture_output=True, timeout=10,
                                    env={**os.environ, 'TMPDIR': d})
                 self.assertEqual(p.returncode, 0)
@@ -88,7 +88,7 @@ class OutputTests(unittest.TestCase):
                               f"while not Path({str(release)!r}).exists(): time.sleep(.01)\n"
                               "print('\\r100%',flush=True)\n")
             shell = core.job_shell('test', shlex.join([sys.executable, str(script)]), d,
-                                   str(root/'saved.log'), 'abc123', str(root/'termination.json'))
+                                   str(root/'saved.log'), 'abc123', str(root/'termination.json'), live_progress=True)
             p = subprocess.Popen(['bash', '-c', shell], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  env={**os.environ, 'TMPDIR': d})
             class PipeResponse:
@@ -141,7 +141,7 @@ class OutputTests(unittest.TestCase):
                             interpreter.chmod(0o755 if unusable == 'broken' else 0o644)
                         command = "bash -c 'printf x >> runs; printf \"HELLO\\n\"; exit "+str(script_rc)+"'"
                         with mock.patch.object(core.sys, 'executable', str(interpreter)):
-                            shell = core.job_shell('test', command, d, str(root/'saved.log'), 'abc123', str(root/'termination.json'))
+                            shell = core.job_shell('test', command, d, str(root/'saved.log'), 'abc123', str(root/'termination.json'), live_progress=True)
                         env = {**os.environ, 'TMPDIR': d}
                         if not available: env['PATH'] = self.restricted_path(root)
                         p = subprocess.run(['/bin/bash', '-c', shell], capture_output=True, timeout=10, env=env)
@@ -170,7 +170,7 @@ class OutputTests(unittest.TestCase):
                 script.write_text('printf x >> runs\nprintf %s '+shlex.quote(payload)+'\nexit '+str(rc)+'\n')
                 with mock.patch.object(core.sys, 'executable', str(interpreter)):
                     shell = core.job_shell('test', 'bash '+shlex.quote(str(script)), d,
-                                           str(root/'saved.log'), 'abc123', str(root/'termination.json'))
+                                           str(root/'saved.log'), 'abc123', str(root/'termination.json'), live_progress=True)
                 p = subprocess.run(['bash', '-c', shell], capture_output=True, timeout=10,
                                    env={**os.environ, 'TMPDIR': d})
                 self.assertEqual(p.returncode, rc)

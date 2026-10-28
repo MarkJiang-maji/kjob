@@ -168,8 +168,8 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("-c", "--cpus", type=int, default=core.DEFAULT_CPUS, help="CPU cores (default 1)")
     p.add_argument("--mem", default=core.DEFAULT_MEMORY, help="memory, e.g. 32Gi (default 2Gi)")
     p.add_argument("--shm", default=core.DEFAULT_SHM, help="/dev/shm size limit, e.g. 8Gi (default: same as --mem)")
-    p.add_argument("-g", "--gpu-type", default="", help=f"comma list of GPU types: {', '.join(core.GPU_PRODUCTS)}, a "
-                   "name shown by ksinfo, or a raw nvidia.com/gpu.product value")
+    p.add_argument("-g", "--gpu-type", default="", help="comma list of GPU types: a name shown by ksinfo (e.g. v100, "
+                   "a5000) or a raw nvidia.com/gpu.product value; kinfo lists the short names this cluster has")
     p.add_argument("-w", "--nodelist", default=None, help="run on this node (kubernetes.io/hostname)")
     p.add_argument("-x", "--exclude", default="", help="comma list of nodes to avoid")
     p.add_argument("-t", "--time", type=_time_arg, default=None,
@@ -179,6 +179,9 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("-D", "--chdir", default=None, help="working directory in the job (default: current directory)")
     p.add_argument("-o", "--log-dir", default=str(Path.home() / "kjob-logs"), help="where the job's output is saved")
     p.add_argument("--ttl", type=int, default=3600, help="delete a finished job after this many seconds if unmonitored")
+    p.add_argument("--live-progress", action="store_true",
+                   help="show progress bars (CR updates) at once in ksrun/kwait/klogs; the pod log is then readable "
+                        "only with kjob (kubectl logs and the Kubeflow UI show framed records)")
     p.add_argument("script", help="script to run (.py with Python, .sh with bash, anything else executed directly)")
     p.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the script")
 
@@ -321,7 +324,8 @@ def _spec(a) -> core.JobSpec:
                         gpu_types=gpu_types, node=node,
                         exclude_nodes=[n for n in a.exclude.split(",") if n], interpreter=a.python, env=env,
                         workdir=str(Path(a.chdir or os.getcwd()).expanduser().resolve()),
-                        log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl, time_limit=a.time)
+                        log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl, time_limit=a.time,
+                        live_progress=a.live_progress)
     spec.validate()
     return spec
 
@@ -545,13 +549,7 @@ def cmd_logs(a) -> int:
         if a.follow:
             if j.wait_for_pod(report=report) in ("Deleted", "Invalid"):   # still pending: wait instead of failing
                 raise ApiException(status=404)
-            for line in j.stream_logs():
-                if re.match(r"\[kjob [^\]]*\] display ", line):
-                    report(line)
-                    continue
-                if j.is_evicted_log_error(line):
-                    report(f"kjob: {a.name} log stream unavailable after eviction: {line}")
-                    continue
+            for line in j.user_lines(report):
                 print(line, end="" if isinstance(line, core.LogFragment) or line.endswith("\r") else "\n", flush=True)
         else:
             pod = j._pod()
@@ -625,6 +623,7 @@ def cmd_acct(a) -> int:
     hist = core.read_history()
     cancels = core.read_events()
     log_errors = {e["run_id"]: e for e in cancels if e.get("event") == "log-error" and e.get("run_id")}
+    evictions = {e["run_id"]: e for e in cancels if e.get("event") == "evicted" and e.get("run_id")}
     try:
         live_jobs = {o["metadata"]["name"]: o for o in core.list_jobs()}
     except (ApiException, HTTPError, ConfigException):
@@ -685,6 +684,9 @@ def cmd_acct(a) -> int:
         if r.get("run_id") in log_errors:
             state = "LOG_ERROR"
             code = log_errors[r["run_id"]].get("exit_code", code)
+        elif r.get("run_id") in evictions:   # recorded by ksrun/kwait; the job may be deleted since
+            state = "EVICTED"
+            code = evictions[r["run_id"]].get("exit_code", code)
         elif actual is not None:
             state, code = actual
             if run and run["stopped"] and state not in ("LOG_ERROR", "EVICTED"):
@@ -841,7 +843,13 @@ def cmd_info(a) -> int:
     print("quota (used / hard):")
     for k, used, hard in core.quota():
         print(f"  {k:28s} {used} / {hard}")
-    print("GPU type short names for -g:", ", ".join(f"{k}={v}" for k, v in core.GPU_PRODUCTS.items()))
+    try:   # only the short names whose GPUs this cluster has (a30 exists only on some clusters)
+        present = {n["product"] for n in cluster.load_snapshot().get("nodes", [])}
+    except (cluster.ClusterViewUnavailable, ApiException, HTTPError, ValueError):
+        present = None
+    names = {k: v for k, v in core.GPU_PRODUCTS.items() if present is None or v in present}
+    if names:
+        print("GPU type short names for -g:", ", ".join(f"{k}={v}" for k, v in names.items()))
     print("cluster GPU types and free GPUs: ksinfo")
     return 0
 

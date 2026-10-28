@@ -1,6 +1,6 @@
 [project]
 name = "kjob"
-version = "0.4.0"
+version = "0.5.0"
 description = "Slurm-like submission of scripts as Kubeflow PyTorchJobs that mirror the current notebook"
 requires-python = ">=3.8"
 dependencies = ["kubernetes>=28"]
