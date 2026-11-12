@@ -79,6 +79,7 @@ ksrun [選項] 腳本 [腳本參數...]     提交、即時輸出、結束後刪
 | `-D, --chdir DIR` | 目前目錄 | 工作的工作目錄 |
 | `-o, --log-dir DIR` | `~/kjob-logs` | 日誌存放處，必須在可寫入的共用磁碟 |
 | `--ttl SECONDS` | `3600` | 工作結束且沒人監看時，工作物件保留多久才自動刪除 |
+| `--priority high\|normal\|low` | `normal` | 叢集有啟用公平排程（fair-scheduler）時，自己 namespace 內排隊 job 的先後順序；不會排到其他 namespace 前面 |
 | `--live-progress` | 關 | tqdm 這類只用 `\r` 更新的進度條即時原地顯示。預設不開：Pod log 保持一般文字，`kubectl logs`、Kubeflow UI 可直接閱讀，但進度條可能要到換行才出現。開啟後 Pod log 改用 `[kjob-output:...]` 傳輸標記，請用 `ksrun`／`kwait`／`klogs` 看；`~/kjob-logs` 的日誌檔一律是原始輸出 |
 
 腳本類型：`.py` 用 Python 執行，`.sh` 用 bash，其他檔案直接執行（需要執行權限）；也可以直接給 image 裡的指令，
@@ -267,6 +268,20 @@ GPU_TYPE（排隊中的顯示它要求的型號，沒指定則為 `any`）、NOD
 GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 
 ## 排隊與錯誤排解
+
+### 公平排程（fair-scheduler）
+
+叢集有為你的 namespace 啟用公平排程時，送出的 GPU job 會先排隊：`ksub` 會印出 `queued by the fair-scheduler`，`kqueue` 的狀態是 `Queued #N`（在整個佇列中排第幾），`kshow` 的 `queue` 一列寫等待原因，`ksrun`／`kwait` 也會在名次改變時提示。
+
+- 先決定輪到哪個 namespace：最近（半衰期 5 天）GPU 用量越少越前面，Notebook 的用量也算。
+- 再決定自己 namespace 內的順序：`--priority`（high → normal → low），同級看送出時間。
+- 正在跑的 job 不會被中斷。CPU-only job（`-G 0`）不排隊。
+- 排隊時間不算進 `-t` 時間限制。
+- 看到 `the fair-scheduler is not running`：排程器暫時沒在運作，job 直接開始，不用處理。
+
+排隊中的 job 只能由排程器放行；自己改 `suspend` 會被拒絕。不想等可以 `kcancel` 後改用有空位的型號重送。
+
+### 其他排隊原因
 
 排隊原因看 `kshow NAME`、`kwait` 的訊息或 `kqueue -A` 的 WAITING_FOR：
 
