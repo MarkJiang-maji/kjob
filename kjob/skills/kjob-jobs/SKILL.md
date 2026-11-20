@@ -107,10 +107,13 @@ them starts hundreds of threads on a few cores and runs slower, not faster. Set 
 
 When writing or reviewing a script for a job, replace auto-detected counts with these values and tell the user.
 
-**Fill the GPU.** Many runs (small models, hyperparameter sweeps, seeds, evaluation) use a small part of a GPU. Check
-one run first: `kexec NAME nvidia-smi` shows GPU-Util and memory used. If one run keeps GPU-Util low or uses well under
-the GPU's memory, do not submit one job per run: put as many runs in one job as fit in the GPU memory (keep some
-headroom for peaks), and raise `-c`/`--mem` for the total. Only split into more jobs when one GPU is really full.
+**Fill the GPU.** Many runs (small models, hyperparameter sweeps, seeds, evaluation) use a small part of a GPU. Measure
+one run first: run `kexec NAME nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv` a few times while it
+trains for GPU-Util and peak memory, and read its speed (steps or samples per second) from the log. If GPU-Util stays
+low, do not submit one job per run: put several runs in one job. Choose how many from the peak memory (GPU memory /
+peak, leaving headroom), then check throughput: N runs together must get more work done per hour than one run alone;
+if each added run slows the others down as much as it adds, use fewer. Raise `-c`/`--mem` for the total. A run that
+already keeps GPU-Util high gains nothing from sharing.
 
 ```bash
 #!/bin/bash

@@ -49,7 +49,7 @@ export PATH="$HOME/.local/bin:$PATH"
 | 有 git，想用 git 安裝 | `python3 -m pip install --user --upgrade 'git+https://github.com/MarkJiang-maji/kjob.git@main'` |
 | 固定某個版本 | 把網址中的 `refs/heads/main` 換成 commit SHA：`.../archive/<sha>.tar.gz` |
 | 虛擬環境內 | 啟用環境後執行 `python -m pip install --upgrade ...`（不加 `--user`） |
-| 沒有網路，用管理員給的 wheel | `python3 -m pip install --user kjob-0.5.0-py3-none-any.whl` |
+| 沒有網路，用管理員給的 wheel | `python3 -m pip install --user kjob-0.6.0-py3-none-any.whl` |
 | 從原始碼開發 | `git clone ...; python3 -m pip install --user -e kjob` |
 | 移除 | `python3 -m pip uninstall kjob` |
 
@@ -237,6 +237,7 @@ ksinfo -w           # 每 10 秒更新
 
 欄位：USER（namespace，`*` 為自己的）、KIND（`Notebook`、`kjob`、`PyTorchJob`、`Pod`）、NAME、STATE、GPU、
 GPU_TYPE（排隊中的顯示它要求的型號，沒指定則為 `any`）、NODE、TIME（執行或等待時間）、WAITING_FOR（排程器說明的等待原因）。
+公平排程佇列中的 job 顯示為 `Queued`，WAITING_FOR 寫 `fair-scheduler queue #N: 原因`，也算在 `--state pending` 與 `ksinfo` 的 WAITING_GPUS 裡。
 最後一行是執行中／排隊中的總數。
 
 ## GPU 型號、受限節點與共享 GPU
@@ -271,7 +272,7 @@ GPU 型號不同但共用同一個 `nvidia.com/gpu` 配額。
 
 ### 公平排程（fair-scheduler）
 
-叢集有為你的 namespace 啟用公平排程時，送出的 GPU job 會先排隊：`ksub` 會印出 `queued by the fair-scheduler`，`kqueue` 的狀態是 `Queued #N`（在整個佇列中排第幾），`kshow` 的 `queue` 一列寫等待原因，`ksrun`／`kwait` 也會在名次改變時提示。
+叢集有為你的 namespace 啟用公平排程時，送出的 GPU job 會先排隊：`ksub` 會印出 `queued by the fair-scheduler`，`kqueue` 的狀態是 `Queued #N`（在整個佇列中排第幾），`kshow` 的 `queue` 一列寫等待原因，`ksrun`／`kwait` 也會在名次改變時提示，`klogs` 會說還沒開始。`kqueue -A` 也看得到其他人排隊中的 job。
 
 - 先決定輪到哪個 namespace：最近（半衰期 5 天）GPU 用量越少越前面，Notebook 的用量也算。
 - 再決定自己 namespace 內的順序：`--priority`（high → normal → low），同級看送出時間。

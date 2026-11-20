@@ -9,17 +9,21 @@ permissions:
 
 jobs:
   offline:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - python: '3.9'
+          - python: '3.9'              # notebook images ship 3.9; ubuntu-latest (26.04) has no 3.9 build
+            os: ubuntu-24.04
             client: kubernetes==32.0.1
           - python: '3.12'
+            os: ubuntu-latest
             client: kubernetes==28.1.0
           - python: '3.12'
+            os: ubuntu-latest
             client: kubernetes==32.0.1
           - python: '3.14'
+            os: ubuntu-latest
             client: kubernetes>=28
     steps:
       - uses: actions/checkout@v7

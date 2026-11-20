@@ -93,5 +93,73 @@ class SubmitOutputTest(unittest.TestCase):
         self.assertIn("queued by the fair-scheduler", out.getvalue())
 
 
+class LogsTest(unittest.TestCase):
+    def test_klogs_on_queued_job_says_queued(self):
+        j = mock.Mock()
+        j.spec.name, j.obj = "train", queued_job()
+        j.state.return_value = "Queued"
+        err = io.StringIO()
+        with mock.patch.object(cli, "_job_for", return_value=j), mock.patch("sys.stderr", err):
+            self.assertEqual(cli.cmd_logs(mock.Mock(name="a", follow=False)), 0)
+        self.assertIn("has not started yet, it is queued (position 2)", err.getvalue())
+        j._pod.assert_not_called()
+
+
+def cluster_job(name, ns="alice", suspend=True, position="4", host=None):
+    job = queued_job(position=position, reason='quota "x" is full', suspend=suspend)
+    job["metadata"].update(name=name, namespace=ns, creationTimestamp="2026-11-12T02:59:00Z",
+                           labels={"app.kubernetes.io/managed-by": "kjob"})
+    spec = {"containers": [{"name": "pytorch", "resources": {"requests": {"nvidia.com/gpu": "2", "cpu": "4",
+                                                                         "memory": "8Gi"}}}]}
+    if host:
+        spec["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+            {"matchFields": [{"key": "metadata.name", "operator": "In", "values": [host]}]}]}}}
+    job["spec"]["pytorchReplicaSpecs"] = {"Master": {"template": {"spec": spec}}}
+    return job
+
+
+class ClusterQueueTest(unittest.TestCase):
+    def snapshot(self, jobs=None, error=None, hide_names=False):
+        from kjob import cluster
+        from test_features import fake_api
+        custom = mock.Mock()
+        if error:
+            custom.list_cluster_custom_object.side_effect = core.ApiException(status=error)
+        else:
+            custom.list_cluster_custom_object.return_value = {"items": jobs or []}
+        return cluster.build_snapshot(fake_api(), hide_names=hide_names, custom_api=custom)
+
+    def test_queued_jobs_are_pending_workloads(self):
+        snap = self.snapshot([cluster_job("wait", host="rtxpro6000"), cluster_job("released", suspend=False)])
+        queued = [w for w in snap["workloads"] if w.get("queued")]
+        self.assertEqual(len(queued), 1)
+        w = queued[0]
+        self.assertEqual((w["namespace"], w["kind"], w["name"], w["state"], w["gpus"], w["cpus"], w["memory_gib"]),
+                         ("alice", "kjob", "wait", "Pending", 2, 4.0, 8.0))
+        self.assertEqual(w["nodes_wanted"], ["rtxpro6000"])
+        self.assertEqual(w["since"], "2026-11-12T03:00:00Z")
+        self.assertEqual(w["reason"], 'fair-scheduler queue #4: quota "x" is full')
+
+    def test_names_hidden(self):
+        w = next(w for w in self.snapshot([cluster_job("wait")], hide_names=True)["workloads"] if w.get("queued"))
+        self.assertEqual((w["name"], w["reason"]), ("-", 'fair-scheduler queue #4: quota "-" is full'))
+
+    def test_without_permission_the_rest_still_publishes(self):
+        snap = self.snapshot(error=403)
+        self.assertFalse(any(w.get("queued") for w in snap["workloads"]))
+        self.assertTrue(snap["workloads"])
+
+    def test_kqueue_all_lists_them_as_queued_and_pending(self):
+        snap = {**self.snapshot([cluster_job("wait")]), "source": "live"}
+        out = io.StringIO()
+        with mock.patch.object(cli.cluster, "load_snapshot", return_value=snap), \
+                mock.patch.object(core, "current_namespace", return_value=NS), mock.patch("sys.stdout", out):
+            cli._cluster_queue(mock.Mock(user=None, state="pending", gpu_type=None))
+        row = next(l for l in out.getvalue().splitlines() if " wait " in l)
+        self.assertIn("Queued", row)
+        self.assertIn("fair-scheduler queue #4", row)
+        self.assertIn("pending: 2 workloads / 10 GPUs", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

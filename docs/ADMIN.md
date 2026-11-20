@@ -48,7 +48,7 @@ kubectl get notebooks -n $NS -o custom-columns=NAME:.metadata.name,SA:.spec.temp
 
 ## 2. 叢集狀態服務（選用，讓使用者看到整個叢集）
 
-`ksinfo` 與 `kqueue -A` 需要列出所有節點與所有 namespace 的 Pod，一般 Notebook 沒有這個權限。這個服務用一個小
+`ksinfo` 與 `kqueue -A` 需要列出所有節點與所有 namespace 的 Pod（以及 fair-scheduler 排隊中、還沒有 Pod 的 PyTorchJob），一般 Notebook 沒有這個權限。這個服務用一個小
 Deployment 每 30 秒把摘要寫進 ConfigMap `kjob-system/kjob-cluster-status`，並只開放所有 service account（Notebook）讀取這一個 ConfigMap。
 沒有安裝時，提交工作不受影響，只是這兩個指令會提示無法使用。
 
@@ -88,7 +88,7 @@ kubectl delete -f deploy/cluster-status.yaml           # 完整移除
 | 方式 | 做法 |
 |---|---|
 | GitHub（預設） | 使用者執行 README 的安裝指令，裝在自己的 `~/.local` |
-| wheel | `python3 -m pip wheel --no-deps -w dist .`，把 `dist/kjob-0.5.0-py3-none-any.whl` 給使用者，`pip install --user` 安裝 |
+| wheel | `python3 -m pip wheel --no-deps -w dist .`，把 `dist/kjob-0.6.0-py3-none-any.whl` 給使用者，`pip install --user` 安裝 |
 | 預裝在 Notebook image | `deploy/Dockerfile`：`docker build --build-arg BASE_IMAGE=<image> --build-arg NOTEBOOK_USER=<原本的 USER> -f deploy/Dockerfile dist/` |
 
 ## 5. 會建立的 Kubernetes 物件

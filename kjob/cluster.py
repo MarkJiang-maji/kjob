@@ -24,6 +24,10 @@ STATUS_CONFIGMAP = "kjob-cluster-status"
 STATUS_KEY = "status.json"
 PRODUCT_LABEL = "nvidia.com/gpu.product"
 GPU = "nvidia.com/gpu"
+# fair-scheduler (cgu-manifests cgu/fair-scheduler): its webhook suspends new GPU PyTorchJobs and annotates them; the
+# scheduler releases them in fair-share order and writes the queue position and the reason it is waiting.
+QUEUED_ANN, BYPASSED_ANN = "fair-scheduler/queued-at", "fair-scheduler/bypassed"
+POSITION_ANN, REASON_ANN = "fair-scheduler/position", "fair-scheduler/reason"
 
 
 class ClusterViewUnavailable(RuntimeError):
@@ -83,8 +87,73 @@ def _workload(pod) -> tuple[str, str]:
     return "Pod", pod.metadata.name
 
 
-def build_snapshot(core_api: client.CoreV1Api | None = None, hide_names: bool = False) -> dict:
-    """Read nodes and pods (needs cluster-wide list permission) and summarise GPU usage."""
+def is_fair_queued(obj: dict) -> bool:
+    """A PyTorchJob waiting in the fair-scheduler queue: queued by its webhook and not released yet."""
+    ann = (obj.get("metadata") or {}).get("annotations") or {}
+    return QUEUED_ANN in ann and bool(((obj.get("spec") or {}).get("runPolicy") or {}).get("suspend"))
+
+
+def _template_values(spec: dict, key: str) -> list[str]:
+    """_affinity_values for a pod template stored in a custom object (camelCase dict)."""
+    values = []
+    req = (((spec.get("affinity") or {}).get("nodeAffinity") or {})
+           .get("requiredDuringSchedulingIgnoredDuringExecution") or {})
+    for term in req.get("nodeSelectorTerms") or []:
+        for e in term.get("matchExpressions") or []:
+            if e.get("key") == key and e.get("operator") == "In":
+                values += e.get("values") or []
+        if key == "kubernetes.io/hostname":
+            values += [v for e in term.get("matchFields") or [] if e.get("key") == "metadata.name"
+                       and e.get("operator") == "In" for v in e.get("values") or []]
+    if key in (spec.get("nodeSelector") or {}):
+        values.append(spec["nodeSelector"][key])
+    return values
+
+
+def _queued_workloads(custom_api, hide_names: bool, now) -> list[dict]:
+    """Fair-queued PyTorchJobs have no pod yet; without them the cluster queue looks shorter than it is."""
+    try:
+        jobs = custom_api.list_cluster_custom_object("kubeflow.org", "v1", "pytorchjobs").get("items", [])
+    except ApiException as e:
+        if e.status in (401, 403, 404):   # status service RBAC not updated yet, or no Training Operator
+            return []
+        raise
+    out = []
+    for o in jobs:
+        if not is_fair_queued(o):
+            continue
+        meta, ann = o["metadata"], o["metadata"].get("annotations") or {}
+        spec = ((((o.get("spec") or {}).get("pytorchReplicaSpecs") or {}).get("Master") or {})
+                .get("template") or {}).get("spec") or {}
+
+        def req(key):
+            return sum(float(parse_quantity(((c.get("resources") or {}).get("requests") or {}).get(key, "0")))
+                       for c in spec.get("containers") or [])
+        try:
+            since = _dt.datetime.fromisoformat((ann.get(QUEUED_ANN) or meta["creationTimestamp"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            since = None
+        pos = ann.get(POSITION_ANN)
+        reason = f"fair-scheduler queue{' #' + pos if pos else ''}: {ann.get(REASON_ANN) or 'waiting for its turn'}"
+        if hide_names:
+            reason = re.sub(r'"[^"]*"', '"-"', reason)
+        kind = "kjob" if (meta.get("labels") or {}).get("app.kubernetes.io/managed-by") == "kjob" else "PyTorchJob"
+        out.append({
+            "namespace": meta["namespace"], "kind": kind, "name": "-" if hide_names else meta["name"], "pod": "-",
+            "state": "Pending", "queued": True,          # Pending: older kjob clients count it as waiting too
+            "gpus": int(req(GPU)), "cpus": req("cpu"), "memory_gib": round(req("memory") / 2**30, 1),
+            "node": "", "products": _template_values(spec, PRODUCT_LABEL),
+            "nodes_wanted": _template_values(spec, "kubernetes.io/hostname"),
+            "since": _iso(since), "age_s": int((now - since).total_seconds()) if since else 0, "reason": reason[:200],
+        })
+    return out
+
+
+def build_snapshot(core_api: client.CoreV1Api | None = None, hide_names: bool = False,
+                   custom_api: client.CustomObjectsApi | None = None) -> dict:
+    """Read nodes and pods (needs cluster-wide list permission) and summarise GPU usage.
+
+    custom_api: also list fair-queued PyTorchJobs (they have no pod while they wait)."""
     core_api = core_api or client.CoreV1Api()
     nodes = core_api.list_node().items
     pods = core_api.list_pod_for_all_namespaces(field_selector="status.phase!=Succeeded,status.phase!=Failed").items
@@ -138,6 +207,8 @@ def build_snapshot(core_api: client.CoreV1Api | None = None, hide_names: bool = 
             "nodes_wanted": _affinity_values(p, "kubernetes.io/hostname"),
             "since": _iso(start), "age_s": int((now - start).total_seconds()) if start else 0, "reason": reason,
         })
+    if custom_api is not None:
+        workloads += _queued_workloads(custom_api, hide_names, now)
     for n in out_nodes.values():
         n["cpus_used"] = round(n["cpus_used"], 1)
         n["memory_used_gib"] = round(n["memory_used_gib"], 1)
@@ -173,10 +244,10 @@ def publish(snapshot: dict, core_api: client.CoreV1Api | None = None) -> None:
 
 
 def publish_loop(interval: int = 30, hide_names: bool = False, report=print) -> None:
-    core_api = client.CoreV1Api()
+    core_api, custom_api = client.CoreV1Api(), client.CustomObjectsApi()
     while True:
         try:
-            snap = build_snapshot(core_api, hide_names)
+            snap = build_snapshot(core_api, hide_names, custom_api)
             publish(snap, core_api)
             report(f"kjob: published {len(snap['nodes'])} GPU nodes, {len(snap['workloads'])} workloads")
         except Exception as e:  # keep publishing after transient API errors
@@ -186,9 +257,10 @@ def publish_loop(interval: int = 30, hide_names: bool = False, report=print) -> 
 
 def load_snapshot(core_api: client.CoreV1Api | None = None) -> dict:
     """Live data when permitted, otherwise the published ConfigMap."""
+    live_custom = None if core_api else client.CustomObjectsApi()   # a caller-supplied core_api: tests
     core_api = core_api or client.CoreV1Api()
     try:
-        snap = build_snapshot(core_api)
+        snap = build_snapshot(core_api, custom_api=live_custom)
         snap["source"] = "live"
         return snap
     except ApiException as e:

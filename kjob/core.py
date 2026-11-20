@@ -49,12 +49,11 @@ MANAGED_VOLUME_PREFIXES = ("gs-", "ns-")
 # containers; a second /dev/shm volume makes the container fail with "Duplicate mount point: /dev/shm".
 SHARING_STRATEGY_LABEL = "nvidia.com/gpu.sharing-strategy"
 TERMINAL = ("Succeeded", "Failed", "Deleted")  # Deleted: the job is gone (kcancel elsewhere, TTL)
-# fair-scheduler (cgu-manifests cgu/fair-scheduler): its webhook suspends new GPU jobs and annotates them; the
-# scheduler releases them in fair-share order and writes the queue position and the reason it is waiting.
+# fair-scheduler annotations: see cluster.py
 PRIORITIES = ("high", "normal", "low")       # order inside the user's own namespace only
 PRIORITY_LABEL = "kjob/priority"
-QUEUED_ANN, BYPASSED_ANN = "fair-scheduler/queued-at", "fair-scheduler/bypassed"
-POSITION_ANN, REASON_ANN = "fair-scheduler/position", "fair-scheduler/reason"
+QUEUED_ANN, BYPASSED_ANN = cluster.QUEUED_ANN, cluster.BYPASSED_ANN
+POSITION_ANN, REASON_ANN = cluster.POSITION_ANN, cluster.REASON_ANN
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, "2Gi"
 DEFAULT_SHM = None   # /dev/shm limit = --mem: only a cap (its use counts toward memory), big enough for DataLoader workers
 STATUS_GRACE_SECONDS = 30  # after the log stream ends, do not wait forever for an operator update
@@ -1057,10 +1056,7 @@ def job_state(obj: dict) -> str:
     return active[-1] if active else "Pending"
 
 
-def is_queued(obj: dict) -> bool:
-    """Waiting in the fair-scheduler queue: queued by its webhook and not released yet."""
-    ann = (obj.get("metadata") or {}).get("annotations") or {}
-    return QUEUED_ANN in ann and bool(((obj.get("spec") or {}).get("runPolicy") or {}).get("suspend"))
+is_queued = cluster.is_fair_queued
 
 
 def submit_note(obj: dict | None) -> str:

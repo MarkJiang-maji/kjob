@@ -458,7 +458,8 @@ def _cluster_queue(a) -> None:
         rows.append({**w, "type": gtype})
     rows.sort(key=lambda w: (w["state"] != "Running", w["type"], -w["age_s"]))
     print(_snapshot_banner(snap))
-    table = [[("*" if w["namespace"] == mine else "") + w["namespace"], w["kind"], w["name"], w["state"], w["gpus"],
+    table = [[("*" if w["namespace"] == mine else "") + w["namespace"], w["kind"], w["name"],
+              "Queued" if w.get("queued") else w["state"], w["gpus"],
               w["type"], w["node"] or "-", _dur(w["age_s"]), w["reason"][:70]] for w in rows]
     _table(["USER", "KIND", "NAME", "STATE", "GPU", "GPU_TYPE", "NODE", "TIME", "WAITING_FOR"], table)
     run = [w for w in rows if w["state"] == "Running"]
@@ -558,6 +559,10 @@ def cmd_logs(a) -> int:
     a.name = j.spec.name
     state = j.state()
     report = lambda m: print(m, file=sys.stderr, flush=True)
+    if state == "Queued" and not a.follow:     # no pod and no output yet: say so instead of "log not found"
+        report(f"kjob: {a.name} has not started yet, it is {core.queue_note(getattr(j, 'obj', None))}; "
+               f"klogs -f {a.name} waits for it")
+        return 0
     try:
         if state == "Deleted":
             raise ApiException(status=404)
@@ -970,7 +975,7 @@ def cmd_install_skills(a) -> int:
 
 def cmd_publish_status(a) -> int:
     if a.once:
-        cluster.publish(cluster.build_snapshot(hide_names=a.hide_names))
+        cluster.publish(cluster.build_snapshot(hide_names=a.hide_names, custom_api=core.client.CustomObjectsApi()))
         return 0
     cluster.publish_loop(a.interval, hide_names=a.hide_names, report=lambda m: print(m, flush=True))
     return 0
