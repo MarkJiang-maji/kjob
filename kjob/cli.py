@@ -179,6 +179,9 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("-D", "--chdir", default=None, help="working directory in the job (default: current directory)")
     p.add_argument("-o", "--log-dir", default=str(Path.home() / "kjob-logs"), help="where the job's output is saved")
     p.add_argument("--ttl", type=int, default=3600, help="delete a finished job after this many seconds if unmonitored")
+    p.add_argument("--priority", choices=core.PRIORITIES, default="normal",
+                   help="order among your own namespace's queued jobs when the cluster runs the fair-scheduler "
+                        "(default normal; it never moves you ahead of other namespaces)")
     p.add_argument("--live-progress", action="store_true",
                    help="show progress bars (CR updates) at once in ksrun/kwait/klogs; the pod log is then readable "
                         "only with kjob (kubectl logs and the Kubeflow UI show framed records)")
@@ -325,7 +328,7 @@ def _spec(a) -> core.JobSpec:
                         exclude_nodes=[n for n in a.exclude.split(",") if n], interpreter=a.python, env=env,
                         workdir=str(Path(a.chdir or os.getcwd()).expanduser().resolve()),
                         log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl, time_limit=a.time,
-                        live_progress=a.live_progress)
+                        live_progress=a.live_progress, priority=a.priority)
     spec.validate()
     return spec
 
@@ -388,6 +391,9 @@ def cmd_submit(a) -> int:
     job = core.KJob(_spec(a))
     name = job.submit()
     print(f"Submitted job {name}  (log: {job.spec.log_path()})")
+    note = core.submit_note(getattr(job, "obj", None))
+    if note:
+        print(f"kjob: {note}")
     return 0
 
 
@@ -424,7 +430,11 @@ def _queue_rows(everyone: bool):
         pod = pods.get(f"{name}-master-0")
         tmpl = o["spec"]["pytorchReplicaSpecs"]["Master"]["template"]["spec"]["containers"][0]
         res = (tmpl.get("resources") or {}).get("requests", {})
-        rows.append([name, core.job_state(o), (o["metadata"].get("labels") or {}).get("kjob/notebook", "-"),
+        state = core.job_state(o)
+        if state == "Queued":
+            pos = (o["metadata"].get("annotations") or {}).get(core.POSITION_ANN)
+            state = f"Queued #{pos}" if pos else state
+        rows.append([name, state, (o["metadata"].get("labels") or {}).get("kjob/notebook", "-"),
                      pod.status.phase if pod else "-", pod.spec.node_name if pod and pod.spec.node_name else "-",
                      res.get("nvidia.com/gpu", "0"), res.get("cpu", "-"), _age(o["metadata"].get("creationTimestamp")),
                      (o["metadata"].get("annotations") or {}).get("kjob/command", "")[-60:]])
@@ -499,6 +509,11 @@ def cmd_show(a) -> int:
     print(f"JobName={a.name}  Namespace={j.ns}  State={core.job_state(o)}")
     print(f"  submitted    {ann.get('kjob/submitted', meta.get('creationTimestamp'))}  (age {_age(meta.get('creationTimestamp'))})")
     print(f"  notebook     {(meta.get('labels') or {}).get('kjob/notebook', '-')}")
+    print(f"  priority     {(meta.get('labels') or {}).get(core.PRIORITY_LABEL, 'normal')}")
+    if core.queue_note(o):
+        print(f"  queue        {core.queue_note(o)}  (since {ann.get(core.QUEUED_ANN)})")
+    elif core.BYPASSED_ANN in ann:
+        print(f"  queue        not queued: {ann[core.BYPASSED_ANN]}")
     print(f"  command      {ann.get('kjob/command', '-')}")
     print(f"  workdir      {ann.get('kjob/workdir', '-')}")
     print(f"  log          {ann.get('kjob/log', '-')}")

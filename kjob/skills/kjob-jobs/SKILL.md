@@ -106,6 +106,7 @@ When your tool blocked the command:
 | `-D, --chdir` | current dir | working directory |
 | `-o, --log-dir` | `~/kjob-logs` | where the output log is written |
 | `--ttl` | 3600 | seconds a finished, unwatched job object is kept |
+| `--priority` | normal | `high`/`normal`/`low`: order among this namespace's own queued jobs when the cluster runs the fair-scheduler; never moves the job ahead of other namespaces |
 | `--live-progress` | off | show `\r` progress bars (tqdm) at once in ksrun/kwait/klogs; the pod log is then framed and reads badly in kubectl logs / the Kubeflow UI. Off: plain pod log, progress may appear only at the next newline |
 
 Script files may also carry options at the top (before the first command): `#KJOB -G 2 -g v100 --mem 64Gi` or
@@ -121,6 +122,15 @@ kqueue -A                 # every GPU workload in the cluster: user (namespace),
 kqueue -A --state pending # only the waiting ones (the queue)
 kqueue -u mxxxxxxx        # one user's (namespace's) workloads
 ```
+
+## Queued by the fair-scheduler (`Queued #N` in kqueue)
+
+Some clusters queue new GPU jobs: `ksub` prints `queued by the fair-scheduler`, `kqueue` shows `Queued #N`, `kshow`
+has a `queue` line with the reason. This is normal, not an error: the job starts when GPUs of its type are free and it
+is this namespace's turn (namespaces with less recent GPU usage, Notebooks included, go first; inside a namespace
+`--priority`, then submit time). Tell the user the position and reason. Queue time does not count toward `-t`.
+Do not try to start a queued job yourself (patching `suspend` is refused) and do not cancel it unless the user asks.
+`the fair-scheduler is not running` means the job started without queueing; nothing to do.
 
 ## Why is my job Pending? (`kshow NAME`, WAITING_FOR column)
 

@@ -49,6 +49,12 @@ MANAGED_VOLUME_PREFIXES = ("gs-", "ns-")
 # containers; a second /dev/shm volume makes the container fail with "Duplicate mount point: /dev/shm".
 SHARING_STRATEGY_LABEL = "nvidia.com/gpu.sharing-strategy"
 TERMINAL = ("Succeeded", "Failed", "Deleted")  # Deleted: the job is gone (kcancel elsewhere, TTL)
+# fair-scheduler (cgu-manifests cgu/fair-scheduler): its webhook suspends new GPU jobs and annotates them; the
+# scheduler releases them in fair-share order and writes the queue position and the reason it is waiting.
+PRIORITIES = ("high", "normal", "low")       # order inside the user's own namespace only
+PRIORITY_LABEL = "kjob/priority"
+QUEUED_ANN, BYPASSED_ANN = "fair-scheduler/queued-at", "fair-scheduler/bypassed"
+POSITION_ANN, REASON_ANN = "fair-scheduler/position", "fair-scheduler/reason"
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, "2Gi"
 DEFAULT_SHM = None   # /dev/shm limit = --mem: only a cap (its use counts toward memory), big enough for DataLoader workers
 STATUS_GRACE_SECONDS = 30  # after the log stream ends, do not wait forever for an operator update
@@ -373,12 +379,15 @@ class JobSpec:
     ttl_seconds: int = 3600                              # safety net if nobody monitors the job
     time_limit: int | None = None                        # seconds; the job is stopped after this (like --time)
     live_progress: bool = False                          # framed pod log: CR progress shows at once (see job_shell)
+    priority: str = "normal"                             # fair-scheduler order among this namespace's queued jobs
 
     def validate(self) -> None:
         if not isinstance(self.gpus, int) or self.gpus < 0:
             raise ValueError("GPU count must be a nonnegative integer.")
         if not isinstance(self.cpus, int) or self.cpus < 1:
             raise ValueError("CPU count must be a positive integer.")
+        if self.priority not in PRIORITIES:
+            raise ValueError(f"Priority must be one of {', '.join(PRIORITIES)}.")
         if not isinstance(self.ttl_seconds, int) or self.ttl_seconds < 0:
             raise ValueError("TTL must be a nonnegative integer.")
         if self.time_limit is not None and (not isinstance(self.time_limit, int) or self.time_limit < 1):
@@ -510,7 +519,8 @@ class KJob:
         return {
             "apiVersion": f"{GROUP}/{VERSION}", "kind": "PyTorchJob",
             "metadata": {"name": s.name, "namespace": self.ns,
-                         "labels": {"app.kubernetes.io/managed-by": MANAGED_BY, "kjob/notebook": t.pod_name},
+                         "labels": {"app.kubernetes.io/managed-by": MANAGED_BY, "kjob/notebook": t.pod_name,
+                                    PRIORITY_LABEL: s.priority},
                          "annotations": {"kjob/command": s.command()[:2000], "kjob/log": log,
                                          "kjob/run-id": self.run_id,
                                          "kjob/workdir": workdir,
@@ -550,6 +560,7 @@ class KJob:
         self._warn_unshared_paths()
         obj = self.custom.create_namespaced_custom_object(GROUP, VERSION, self.ns, PLURAL, self.manifest())
         self.uid = obj["metadata"]["uid"]
+        self.obj = obj                     # as admitted: the fair-scheduler webhook may have queued it
         record_history(self)
         return self.spec.name
 
@@ -605,6 +616,7 @@ class KJob:
             if getattr(self, "uid", uid) != uid:
                 return "Deleted"
             self.uid = uid
+            self.obj = obj
             # kwait starts without the run id. An evicted container is SIGKILLed before the wrapper can report it,
             # so take it from the CR: kacct matches the evicted/log-error events by it.
             run_id = (obj["metadata"].get("annotations") or {}).get("kjob/run-id")
@@ -635,6 +647,11 @@ class KJob:
             st = self.state()
             if st == "Deleted":
                 return st
+            if st == "Queued":
+                note = queue_note(getattr(self, "obj", None))
+                if note not in seen:
+                    seen.add(note)
+                    report(f"kjob: {self.spec.name} {note}")
             try:
                 pod = self._pod()
                 phase = pod.status.phase
@@ -925,6 +942,9 @@ class KJob:
         report = report or (lambda m: print(m, file=sys.stderr, flush=True))
         self.submit()
         report(f"kjob: submitted {self.spec.name} (log: {self.spec.log_path()})")
+        note = submit_note(getattr(self, "obj", None))
+        if note:
+            report(f"kjob: {note}")
         try:
             code = self.follow(out=out, report=report)
         except (KeyboardInterrupt, BrokenPipeError) as e:   # Ctrl-C, or the reader of our output (| head) went away
@@ -1032,7 +1052,36 @@ def job_state(obj: dict) -> str:
     for terminal in ("Failed", "Succeeded"):
         if terminal in active:
             return terminal
+    if is_queued(obj):
+        return "Queued"
     return active[-1] if active else "Pending"
+
+
+def is_queued(obj: dict) -> bool:
+    """Waiting in the fair-scheduler queue: queued by its webhook and not released yet."""
+    ann = (obj.get("metadata") or {}).get("annotations") or {}
+    return QUEUED_ANN in ann and bool(((obj.get("spec") or {}).get("runPolicy") or {}).get("suspend"))
+
+
+def submit_note(obj: dict | None) -> str:
+    """What the fair-scheduler webhook did with a job that was just created ('' if nothing)."""
+    ann = ((obj or {}).get("metadata") or {}).get("annotations") or {}
+    if is_queued(obj or {}):
+        return ("queued by the fair-scheduler: it starts when GPUs are free and it is this namespace's turn "
+                "(kqueue shows its position)")
+    if BYPASSED_ANN in ann:
+        return "the fair-scheduler is not running, so this job starts without queueing"
+    return ""
+
+
+def queue_note(obj: dict | None) -> str:
+    """'queued (position 3): <reason>' for a queued job, '' otherwise."""
+    if not obj or not is_queued(obj):
+        return ""
+    ann = obj["metadata"].get("annotations") or {}
+    pos = ann.get(POSITION_ANN)
+    where = f" (position {pos})" if pos else ""
+    return f"queued{where}: {ann.get(REASON_ANN) or 'waiting for the fair-scheduler'}"
 
 
 def list_jobs(ns: str | None = None, everyone: bool = False, notebook: str | None = None) -> list[dict]:
