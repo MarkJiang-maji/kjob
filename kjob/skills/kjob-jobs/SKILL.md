@@ -17,6 +17,10 @@ kjob runs a script as a PyTorchJob that copies the Notebook: same image, same wo
 * Ask before `kcancel --all-mine`, `kcancel --all-notebooks` or anything that deletes several jobs.
 * Request what the script needs, not the maximum: GPUs are shared with the whole lab. Prefer `-G 1` unless the code
   is multi-GPU (DDP/torchrun). Always set a time limit with `-t` for long runs.
+* Size CPU threads from the job's `-c`, never from auto-detection: inside a job the node's core count (e.g. 256) is
+  visible, not the job's. See [Use what the job requests](#use-what-the-job-requests).
+* Do not leave a GPU mostly idle: when one run cannot use most of the GPU or its memory, run several of them in one
+  job instead of one job per run. See [Use what the job requests](#use-what-the-job-requests).
 * Do not run heavy training directly in the Notebook terminal; submit it.
 * Report the job name, GPU type and log path to the user after submitting.
 
@@ -88,6 +92,42 @@ When your tool blocked the command:
    ```
 
 5. **Results** are wherever the script wrote them; the full output is also in `~/kjob-logs/NAME.log`.
+
+## Use what the job requests
+
+**Threads follow `-c`.** A job gets `-c` CPU cores, but `nproc`, `os.cpu_count()`, `multiprocessing.cpu_count()`,
+PyTorch's default thread count and `n_jobs=-1` all see every core of the node (e.g. 256). Code that sizes itself from
+them starts hundreds of threads on a few cores and runs slower, not faster. Set every count from `-c` explicitly:
+
+* `--env OMP_NUM_THREADS=N --env MKL_NUM_THREADS=N --env OPENBLAS_NUM_THREADS=N` (or `export` them in the `.sh`),
+  `torch.set_num_threads(N)` in Python;
+* DataLoader `num_workers`, `Pool(processes=...)`, joblib/scikit-learn `n_jobs`: fixed numbers that fit in `-c`,
+  never `-1`, `None` or `os.cpu_count()`;
+* several programs in one job: divide `-c` among them (8 cores, 4 runs: 2 threads each).
+
+When writing or reviewing a script for a job, replace auto-detected counts with these values and tell the user.
+
+**Fill the GPU.** Many runs (small models, hyperparameter sweeps, seeds, evaluation) use a small part of a GPU. Check
+one run first: `kexec NAME nvidia-smi` shows GPU-Util and memory used. If one run keeps GPU-Util low or uses well under
+the GPU's memory, do not submit one job per run: put as many runs in one job as fit in the GPU memory (keep some
+headroom for peaks), and raise `-c`/`--mem` for the total. Only split into more jobs when one GPU is really full.
+
+```bash
+#!/bin/bash
+#KJOB -J sweep -G 1 -c 8 --mem 48Gi -t 8:00:00
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2     # 8 cores / 4 runs
+mkdir -p out
+pids=()
+for lr in 1e-3 3e-4 1e-4 3e-5; do
+  python -u train.py --lr "$lr" --workers 1 --out "out/lr$lr" > "out/lr$lr.log" 2>&1 &
+  pids+=($!)
+done
+rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done   # the job fails if any run failed
+exit $rc
+```
+
+Each run writes its own output directory and log; the job's own log (`~/kjob-logs/sweep.log`) shows only what the
+`.sh` prints. A larger batch size is the other way to raise utilisation of a single run.
 
 ## Options of ksub / ksrun
 
