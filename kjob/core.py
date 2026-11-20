@@ -33,6 +33,7 @@ from ._output import DISPLAY_PROGRAM, frame_prefix, pod_output_chunks
 
 GROUP, VERSION, PLURAL = "kubeflow.org", "v1", "pytorchjobs"
 MANAGED_BY = "kjob"
+FAIR_LABEL, FAIR_QUEUE = "kjob/queue", "fair"     # jobs the fair scheduler releases (see scheduler.py)
 SIDECAR_CONTAINERS = {"istio-proxy"}
 # Notebook env that must not reach a job: kjob sets these itself (GPU visibility depends on the job's own GPUs).
 KJOB_ENV = {"PYTHONUNBUFFERED", "KJOB_NAME", "KJOB_NODE", "NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"}
@@ -373,6 +374,7 @@ class JobSpec:
     ttl_seconds: int = 3600                              # safety net if nobody monitors the job
     time_limit: int | None = None                        # seconds; the job is stopped after this (like --time)
     live_progress: bool = False                          # framed pod log: CR progress shows at once (see job_shell)
+    fair: bool = False                                   # created suspended; the fair scheduler releases it
 
     def validate(self) -> None:
         if not isinstance(self.gpus, int) or self.gpus < 0:
@@ -510,7 +512,8 @@ class KJob:
         return {
             "apiVersion": f"{GROUP}/{VERSION}", "kind": "PyTorchJob",
             "metadata": {"name": s.name, "namespace": self.ns,
-                         "labels": {"app.kubernetes.io/managed-by": MANAGED_BY, "kjob/notebook": t.pod_name},
+                         "labels": {"app.kubernetes.io/managed-by": MANAGED_BY, "kjob/notebook": t.pod_name,
+                                    **({FAIR_LABEL: FAIR_QUEUE} if s.fair else {})},
                          "annotations": {"kjob/command": s.command()[:2000], "kjob/log": log,
                                          "kjob/run-id": self.run_id,
                                          "kjob/workdir": workdir,
@@ -518,7 +521,8 @@ class KJob:
             "spec": {
                 # RestartPolicy Never already makes script failures terminal. A zero backoffLimit
                 # on older operators deletes a failed Pod before recording Failed and can recreate it.
-                "runPolicy": {"cleanPodPolicy": "None", "ttlSecondsAfterFinished": s.ttl_seconds},
+                "runPolicy": {"cleanPodPolicy": "None", "ttlSecondsAfterFinished": s.ttl_seconds,
+                              **({"suspend": True} if s.fair else {})},
                 "pytorchReplicaSpecs": {"Master": {"replicas": 1, "restartPolicy": "Never",
                                                    "template": api.sanitize_for_serialization(template)}},
             },
@@ -635,6 +639,9 @@ class KJob:
             st = self.state()
             if st == "Deleted":
                 return st
+            if st == "Queued" and st not in seen:
+                seen.add(st)
+                report(f"kjob: {self.spec.name} queued: waiting for the fair scheduler to release it")
             try:
                 pod = self._pod()
                 phase = pod.status.phase
@@ -1032,6 +1039,10 @@ def job_state(obj: dict) -> str:
     for terminal in ("Failed", "Succeeded"):
         if terminal in active:
             return terminal
+    if (obj.get("spec") or {}).get("runPolicy", {}).get("suspend"):
+        # The operator sets no Suspended condition, and leaves Running set after deleting a re-suspended job's pods.
+        fair = ((obj.get("metadata") or {}).get("labels") or {}).get(FAIR_LABEL) == FAIR_QUEUE
+        return "Queued" if fair and not (obj.get("status") or {}).get("startTime") else "Suspended"
     return active[-1] if active else "Pending"
 
 

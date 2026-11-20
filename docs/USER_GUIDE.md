@@ -80,6 +80,7 @@ ksrun [選項] 腳本 [腳本參數...]     提交、即時輸出、結束後刪
 | `-o, --log-dir DIR` | `~/kjob-logs` | 日誌存放處，必須在可寫入的共用磁碟 |
 | `--ttl SECONDS` | `3600` | 工作結束且沒人監看時，工作物件保留多久才自動刪除 |
 | `--live-progress` | 關 | tqdm 這類只用 `\r` 更新的進度條即時原地顯示。預設不開：Pod log 保持一般文字，`kubectl logs`、Kubeflow UI 可直接閱讀，但進度條可能要到換行才出現。開啟後 Pod log 改用 `[kjob-output:...]` 傳輸標記，請用 `ksrun`／`kwait`／`klogs` 看；`~/kjob-logs` 的日誌檔一律是原始輸出 |
+| `--fair` | 關 | 進入公平排隊：輪到你的 namespace 才開始，`kqueue` 顯示 `Queued`。需要管理員安裝公平排程服務，沒有安裝時工作會一直停在 `Queued` |
 
 腳本類型：`.py` 用 Python 執行，`.sh` 用 bash，其他檔案直接執行（需要執行權限）；也可以直接給 image 裡的指令，
 例如 `ksrun -G 1 nvidia-smi`。腳本名稱之後的所有參數都交給腳本：`ksub -G 1 train.py -c config.yaml` 的 `-c` 是給
@@ -379,5 +380,5 @@ GPU 工作的 `CUDA_VISIBLE_DEVICES` 由系統設定；`-G 0` 的工作看不到
 * 沿用 Notebook 的 image，不能另外指定；只裝在 Notebook 系統目錄的套件工作看不到。
 * 單一 Pod：一個工作就是一台節點上的一個容器，多 GPU 請在腳本內用 `torchrun`，不支援跨節點分散式訓練。
 * 不支援 job array、`--dependency`、`sattach`、email 通知。
-* 排隊由 Kubernetes 排程器處理，不是嚴格先到先得，也沒有公平分享（fair share）。
+* 沒有加 `--fair` 時，排隊由 Kubernetes 排程器處理，不是嚴格先到先得，也沒有公平分享（fair share）。
 * kjob 的檢查是方便使用者的提示，不取代叢集本身的權限與配額控制。

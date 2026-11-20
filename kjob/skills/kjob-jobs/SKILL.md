@@ -107,6 +107,7 @@ When your tool blocked the command:
 | `-o, --log-dir` | `~/kjob-logs` | where the output log is written |
 | `--ttl` | 3600 | seconds a finished, unwatched job object is kept |
 | `--live-progress` | off | show `\r` progress bars (tqdm) at once in ksrun/kwait/klogs; the pod log is then framed and reads badly in kubectl logs / the Kubeflow UI. Off: plain pod log, progress may appear only at the next newline |
+| `--fair` | off | wait in the fair queue (state `Queued`) until the namespace's turn comes; needs the administrator's fair scheduler service, without it the job stays `Queued` |
 
 Script files may also carry options at the top (before the first command): `#KJOB -G 2 -g v100 --mem 64Gi` or
 Slurm-style `#SBATCH --gres=gpu:v100:2 --mem=64G -t 1-00:00:00 -c 8 -J name`. Unsupported `#SBATCH` options

@@ -72,6 +72,7 @@ kacct                     # 自己提交過的工作、結束代碼、執行時�
 | `-D, --chdir` / `-o, --log-dir` | 目前目錄 / `~/kjob-logs` | 工作目錄／日誌位置 |
 | `--ttl` | 3600 | 結束且沒人監看的工作保留幾秒 |
 | `--live-progress` | 關 | 進度條（`\r` 更新）即時原地顯示；Pod log 改用傳輸標記，`kubectl logs`／Kubeflow UI 會看到標記格式 |
+| `--fair` | 關 | 進入公平排隊，輪到自己的 namespace 才開始；需要管理員安裝公平排程服務（見 `docs/ADMIN.md`） |
 
 `.py` 用 Python 執行、`.sh` 用 bash，其他直接執行。選項也可以寫在腳本開頭的 `#SBATCH` 或 `#KJOB` 行。
 

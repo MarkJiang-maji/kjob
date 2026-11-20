@@ -37,7 +37,7 @@ from kubernetes.client.rest import ApiException
 from kubernetes.config import ConfigException
 from urllib3.exceptions import HTTPError
 
-from . import cluster, core
+from . import cluster, core, scheduler
 from ._output import decode_pod_output
 
 SKILLS_DIR = Path(__file__).parent / "skills"
@@ -182,6 +182,9 @@ def _add_job_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--live-progress", action="store_true",
                    help="show progress bars (CR updates) at once in ksrun/kwait/klogs; the pod log is then readable "
                         "only with kjob (kubectl logs and the Kubeflow UI show framed records)")
+    p.add_argument("--fair", action="store_true",
+                   help="wait in the fair queue: the fair scheduler starts the job when its namespace's turn comes "
+                        "(needs deploy/fair-scheduler.yaml; without the service the job stays Queued)")
     p.add_argument("script", help="script to run (.py with Python, .sh with bash, anything else executed directly)")
     p.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the script")
 
@@ -325,7 +328,7 @@ def _spec(a) -> core.JobSpec:
                         exclude_nodes=[n for n in a.exclude.split(",") if n], interpreter=a.python, env=env,
                         workdir=str(Path(a.chdir or os.getcwd()).expanduser().resolve()),
                         log_dir=str(Path(a.log_dir).expanduser().resolve()), ttl_seconds=a.ttl, time_limit=a.time,
-                        live_progress=a.live_progress)
+                        live_progress=a.live_progress, fair=a.fair)
     spec.validate()
     return spec
 
@@ -961,6 +964,17 @@ def cmd_publish_status(a) -> int:
     return 0
 
 
+def cmd_fair_scheduler(a) -> int:
+    options = dict(resource=a.resource, namespaces=[n for n in a.namespaces.split(",") if n] or None,
+                   max_in_use=a.max_in_use, reserve_seconds=a.reserve_seconds, dry_run=a.dry_run,
+                   report=lambda m: print(m, flush=True))
+    if a.once:
+        scheduler.reconcile(**options)
+        return 0
+    scheduler.run(a.interval, **options)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="kjob", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1015,6 +1029,17 @@ def build_parser() -> argparse.ArgumentParser:
                        "~/.agents/skills, linked from ~/.claude/skills)")
     p.add_argument("--dir", default=None, help="copy them into another skills directory instead")
     p.set_defaults(fn=cmd_install_skills)
+    p = sub.add_parser("fair-scheduler", help="(administrators) release --fair jobs, least-served namespace first")
+    p.add_argument("--interval", type=int, default=15, help="seconds between passes")
+    p.add_argument("--once", action="store_true", help="run one pass and exit")
+    p.add_argument("--dry-run", action="store_true", help="only report what would be released")
+    p.add_argument("--namespaces", default="", help="comma list: manage only these namespaces' jobs (default: all)")
+    p.add_argument("--max-in-use", type=float, default=None,
+                   help="most of the resource that released jobs may hold in total (default: no limit)")
+    p.add_argument("--reserve-seconds", type=int, default=scheduler.RESERVE_SECONDS,
+                   help="how long a released job's capacity stays reserved while its pod is not placed")
+    p.add_argument("--resource", default=scheduler.GPU, help="resource shared fairly (other than GPUs: for testing)")
+    p.set_defaults(fn=cmd_fair_scheduler)
     p = sub.add_parser("publish-status", help="(administrators) publish the cluster status ConfigMap")
     for sp in sub.choices.values():
         sp.set_defaults(parser=sp)
@@ -1039,7 +1064,7 @@ def main(argv=None) -> int:
     if getattr(a, "args", None) and a.args[:1] == ["--"]:
         a.args = a.args[1:]
     try:
-        if a.cmd not in ("install-skills", "publish-status"):
+        if a.cmd not in ("install-skills", "publish-status", "fair-scheduler"):
             auto_install_skills()
         if a.cmd not in ("install-skills", "acct"):
             try:

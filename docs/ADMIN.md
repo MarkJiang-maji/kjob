@@ -107,7 +107,32 @@ kubectl get pytorchjobs -A -l app.kubernetes.io/managed-by=kjob
 kubectl delete pytorchjobs -n <namespace> -l app.kubernetes.io/managed-by=kjob
 ```
 
-## 6. 尚未處理的平台事項
+## 6. 公平排隊（選用）
+
+`ksub --fair` 建立的工作帶 `runPolicy.suspend: true` 與標籤 `kjob/queue=fair`，operator 不會建立 Pod。
+`kjob fair-scheduler` 定期檢查這些工作，把空出的資源一次一個分給目前占用最少的 namespace，再由 Kubernetes 決定節點。
+不需要 Kueue，等待中的工作就存在 PyTorchJob 物件上，排程器重啟不會遺失。
+
+```bash
+kubectl apply -f deploy/fair-scheduler.yaml      # 先把 KJOB_SOURCE 改成審過的 commit
+kjob fair-scheduler --once --dry-run             # 有叢集權限時，只列出會放行哪些工作
+```
+
+* 選擇順序：占用 GPU 最少的 namespace 優先（Notebook 也算），相同時看誰等最久；同一 namespace 內由舊到新，放不下的先跳過。
+* 計算會考慮節點的 GPU、CPU、記憶體、節點限制、taint 與 namespace 的 ResourceQuota。放行後到 Pod 排上節點前會先預留，
+  最多 300 秒（`--reserve-seconds`）；逾時後不再預留，但工作不會被取消。
+* 不會暫停或中斷執行中的工作：operator 會刪除被重新暫停的工作的 Pod，而且狀態仍顯示 Running，所以排程器也不會放行曾經啟動過的工作。
+* 試行時可用 `--namespaces` 限定範圍、`--max-in-use` 限制放行工作的總用量。只能跑一個 replica。
+
+目前的限制：
+
+* 只有 `--fair` 的工作會排隊，其他工作與 Notebook 不受管制。使用者有權修改自己的 PyTorchJob，能自行解除暫停，要強制執行需要另外加 webhook。
+* 只看目前占用量，不看累積 GPU 時數，也還沒有工作優先權。
+* 放行不會鎖定 GPU：Notebook 同時搶到資源時，工作會是 Pending。
+* 需要很多 GPU 的工作可能因為小工作先佔用而一直等待。
+* `kqueue -A`、`ksinfo` 只讀 Pod，看不到還在排隊的工作；用 `kubectl get pytorchjobs -A -l kjob/queue=fair` 查看。
+
+## 7. 尚未處理的平台事項
 
 kjob 的提交前檢查只是給使用者的提示，不能取代伺服器端的控制。以下需要在平台層處理：依 GPU 型號分配額、
-公平排隊（例如 Kueue）、限制工作可掛載的 NFS 路徑的 admission policy。
+強制所有工作走公平排隊的 webhook、限制工作可掛載的 NFS 路徑的 admission policy。
